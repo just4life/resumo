@@ -1,0 +1,32 @@
+[package]
+name = "vplayer-android"
+version = "0.1.0"
+edition = "2021"
+description = "VPlayer for Android: the desktop player's code built as a NativeActivity library"
+license = "GPL-2.0-or-later"
+build = "build.rs"
+
+[lib]
+name = "vplayer"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+egui = "0.37"
+jni = "0.21"
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+log = "0.4"
+libc = "0.2"
+android_logger = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# winit 0.30 stops drawing as soon as the activity is paused, which freezes
+# the picture-in-picture window; the copy in vendor/winit keeps drawing until
+# the activity is stopped (the only change, in src/platform_impl/android/mod.rs).
+[patch.crates-io]
+winit = { path = "vendor/winit" }

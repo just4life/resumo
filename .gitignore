@@ -1,0 +1,7 @@
+target/
+dist/
+*.keystore
+*.jks
+*.apk
+*.aab
+*.idsig
