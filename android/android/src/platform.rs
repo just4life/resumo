@@ -98,7 +98,7 @@ fn vm() -> JavaVM {
 /// Runs `f` with a JNI env for this thread and the activity object. Java
 /// exceptions are logged and cleared, and turn into `None`. Local references
 /// are freed on return (the thread stays attached, so nothing else would).
-fn with_env<R>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<R>) -> Option<R> {
+pub(crate) fn with_env<R>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<R>) -> Option<R> {
     let vm = vm();
     let mut env = vm.attach_current_thread_permanently().ok()?;
     // SAFETY: a global reference owned by the NativeActivity glue.
@@ -115,6 +115,11 @@ fn with_env<R>(f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<R>) 
             None
         }
     }
+}
+
+/// Runs `f` on the activity's main thread, the one Android views belong to.
+pub(crate) fn on_main_thread(f: impl FnOnce() + Send + 'static) {
+    app().run_on_java_main_thread(Box::new(f));
 }
 
 /// libVLC's audio (AudioTrack, AAudio) and hardware decoding (MediaCodec)
@@ -296,7 +301,7 @@ pub fn set_brightness(v: f32) {
 /// Lets the window cover the camera cutout too (Android 9+), so the video
 /// reaches the screen's edge around the camera instead of stopping short of
 /// it with a black strip. The app keeps its controls out of the cutout, see
-/// [`cutout`].
+/// [`safe_insets`].
 fn use_cutout_area() {
     if sdk_int() < 28 {
         return;
@@ -314,42 +319,51 @@ fn use_cutout_area() {
     }));
 }
 
-/// How far the camera cutout reaches into the window from each edge, in
-/// pixels: left, top, right, bottom. Kept up to date by [`refresh_cutout`].
-static CUTOUT: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
-static CUTOUT_QUEUED: AtomicBool = AtomicBool::new(false);
+/// How far the camera cutout, and system bars that stay over the window (the
+/// taskbar of foldables and tablets), reach into the window from each edge,
+/// in pixels: left, top, right, bottom. Kept up to date by [`refresh_insets`].
+static INSETS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+static INSETS_QUEUED: AtomicBool = AtomicBool::new(false);
 
-pub fn cutout() -> [f32; 4] {
-    CUTOUT.each_ref().map(|v| v.load(Ordering::Relaxed) as f32)
+pub fn safe_insets() -> [f32; 4] {
+    INSETS.each_ref().map(|v| v.load(Ordering::Relaxed) as f32)
 }
 
-/// Re-reads the cutout (it moves when the screen turns). The window's insets
-/// are read on Android's UI thread.
-pub fn refresh_cutout() {
-    if sdk_int() < 28 || CUTOUT_QUEUED.swap(true, Ordering::SeqCst) {
+/// Re-reads the insets (the cutout moves when the screen turns, the taskbar
+/// comes and goes). The window's insets are read on Android's UI thread.
+pub fn refresh_insets() {
+    if sdk_int() < 28 || INSETS_QUEUED.swap(true, Ordering::SeqCst) {
         return;
     }
     app().run_on_java_main_thread(Box::new(|| {
-        CUTOUT_QUEUED.store(false, Ordering::SeqCst);
+        INSETS_QUEUED.store(false, Ordering::SeqCst);
         let insets = with_env(|env, activity| {
             let window = env.call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?.l()?;
             let decor = env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?.l()?;
             let insets = env.call_method(&decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;", &[])?.l()?;
+            let mut out = [0; 4];
             if insets.is_null() {
-                return Ok([0; 4]);
+                return Ok(out);
             }
             let cutout = env.call_method(&insets, "getDisplayCutout", "()Landroid/view/DisplayCutout;", &[])?.l()?;
-            if cutout.is_null() {
-                return Ok([0; 4]);
+            if !cutout.is_null() {
+                for (v, name) in out.iter_mut().zip(["getSafeInsetLeft", "getSafeInsetTop", "getSafeInsetRight", "getSafeInsetBottom"]) {
+                    *v = env.call_method(&cutout, name, "()I", &[])?.i()?.max(0) as u32;
+                }
             }
-            let mut out = [0; 4];
-            for (v, name) in out.iter_mut().zip(["getSafeInsetLeft", "getSafeInsetTop", "getSafeInsetRight", "getSafeInsetBottom"]) {
-                *v = env.call_method(&cutout, name, "()I", &[])?.i()?.max(0) as u32;
+            // Bars on screen right now (hidden ones count as nothing).
+            if sdk_int() >= 30 {
+                let ty = |env: &mut JNIEnv, name: &str| env.call_static_method("android/view/WindowInsets$Type", name, "()I", &[])?.i();
+                let types = ty(env, "systemBars")? | ty(env, "tappableElement")?;
+                let bars = env.call_method(&insets, "getInsets", "(I)Landroid/graphics/Insets;", &[JValue::Int(types)])?.l()?;
+                for (v, name) in out.iter_mut().zip(["left", "top", "right", "bottom"]) {
+                    *v = (*v).max(env.get_field(&bars, name, "I")?.i()?.max(0) as u32);
+                }
             }
             Ok(out)
         });
         if let Some(insets) = insets {
-            for (slot, v) in CUTOUT.iter().zip(insets) {
+            for (slot, v) in INSETS.iter().zip(insets) {
                 slot.store(v, Ordering::Relaxed);
             }
         }

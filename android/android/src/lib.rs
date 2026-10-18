@@ -1,6 +1,7 @@
 //! VPlayer for Android. The player itself is the desktop code in `../src`;
 //! this crate builds it as the native library of a NativeActivity and adds
-//! the Android glue in `platform.rs`.
+//! the Android glue in `platform.rs` and the hardware video output in
+//! `surface.rs`.
 
 #![allow(dead_code)] // the desktop window chrome (title bar, resize edges) is compiled but unused here
 
@@ -19,6 +20,7 @@ mod platform;
 mod playlist;
 #[path = "../../src/store.rs"]
 mod store;
+mod surface;
 #[path = "../../src/taskbar.rs"]
 mod taskbar;
 #[path = "../../src/theme.rs"]
@@ -40,7 +42,12 @@ fn android_main(app: AndroidApp) {
     std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
     platform::init(&app);
 
-    let options = eframe::NativeOptions { android_app: Some(app), ..Default::default() };
+    // With alpha: the video layer shows through where the window is clear.
+    let options = eframe::NativeOptions {
+        android_app: Some(app),
+        viewport: egui::ViewportBuilder::default().with_transparent(true),
+        ..Default::default()
+    };
     let result = eframe::run_native(
         "VPlayer",
         options,

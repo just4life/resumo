@@ -32,6 +32,10 @@ pub struct Store {
     positions: Vec<(String, i64)>,
     pub volume: Option<i32>,
     pub audio_device: Option<String>,
+    /// The user turned off our HDR → SDR conversion.
+    pub hdr_off: bool,
+    /// Brightness of converted HDR video, percent (100 = default).
+    pub hdr_brightness: Option<i32>,
     dirty: bool,
 }
 
@@ -57,6 +61,8 @@ impl Store {
                 match line.split_once('=') {
                     Some(("volume", v)) => store.volume = v.trim().parse().ok(),
                     Some(("audio_device", v)) if !v.is_empty() => store.audio_device = Some(v.to_owned()),
+                    Some(("hdr_to_sdr", v)) => store.hdr_off = v.trim() == "off",
+                    Some(("hdr_brightness", v)) => store.hdr_brightness = v.trim().parse().ok(),
                     _ => {}
                 }
             }
@@ -108,6 +114,20 @@ impl Store {
         }
     }
 
+    pub fn set_hdr_off(&mut self, off: bool) {
+        if self.hdr_off != off {
+            self.hdr_off = off;
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_hdr_brightness(&mut self, percent: i32) {
+        if self.hdr_brightness != Some(percent) {
+            self.hdr_brightness = Some(percent);
+            self.dirty = true;
+        }
+    }
+
     /// Writes both files if anything changed since the last save.
     pub fn save(&mut self) {
         if !self.dirty {
@@ -130,6 +150,12 @@ impl Store {
         }
         if let Some(d) = &self.audio_device {
             settings.push_str(&format!("audio_device={d}\n"));
+        }
+        if self.hdr_off {
+            settings.push_str("hdr_to_sdr=off\n");
+        }
+        if let Some(b) = self.hdr_brightness {
+            settings.push_str(&format!("hdr_brightness={b}\n"));
         }
         let ok = write_atomic(&dir.join("positions.tsv"), &positions)
             && write_atomic(&dir.join("settings.txt"), &settings);
@@ -157,6 +183,8 @@ mod tests {
         s.set_position("/v/c.mkv", 595_000, Some(600_000)); // near the end: not stored
         s.set_volume(65);
         s.set_audio_device(Some("hw:1,0".into()));
+        s.set_hdr_off(true);
+        s.set_hdr_brightness(85);
         s.save();
 
         let mut t = Store::load_from(Some(dir.clone()));
@@ -165,6 +193,8 @@ mod tests {
         assert_eq!(t.position("/v/c.mkv"), None);
         assert_eq!(t.volume, Some(65));
         assert_eq!(t.audio_device.as_deref(), Some("hw:1,0"));
+        assert!(t.hdr_off);
+        assert_eq!(t.hdr_brightness, Some(85));
 
         // Watching to the end forgets the saved position.
         t.set_position("/v/a.mkv", 599_000, Some(600_000));

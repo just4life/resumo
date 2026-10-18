@@ -1,7 +1,7 @@
 //! The player window: video surface, controls, playlist and menus.
 
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,17 +12,26 @@ use egui::{
 };
 
 use crate::crop::{self, Crop};
+use crate::hdr::{self, HdrInfo, Transfer};
+use crate::hdr_gl;
 use crate::playlist::{self, Playlist, Repeat};
 use crate::store::Store;
 use crate::taskbar::{self, ThumbBar};
 use crate::theme::{self, Icon};
-use crate::video::VideoSink;
+use crate::video::{PixelFormat, VideoSink};
 use crate::vlc::{self, Instance, MediaPlayer};
 
 const SPEEDS: &[f32] = &[0.25, 0.5, 0.75, 1.0, 1.15, 1.25, 1.5, 1.75, 2.0, 3.0];
 const HIDE_CONTROLS_AFTER: Duration = Duration::from_millis(2500);
 const SAVE_EVERY: Duration = Duration::from_secs(5);
 const VOLUME_STEP: i32 = 5;
+/// If no 10-bit frame shows up this long after an HDR video started, libVLC
+/// could not deliver them; fall back to its own (washed-out) RGBA.
+const HDR_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
+/// HDR brightness (nits) shown as white at 100 % in the HDR menu. BT.2408's
+/// 203 nits came out brighter than other players; this matches PotPlayer.
+const HDR_WHITE_NITS: f32 = 290.0;
+const HDR_BRIGHTNESS: std::ops::RangeInclusive<i32> = 50..=150;
 
 /// Flags set from libVLC's event thread and consumed on the UI thread.
 #[derive(Default)]
@@ -58,6 +67,19 @@ pub struct PlayerApp {
     frame_serial: u64,
     frame_size: (f32, f32),
 
+    /// GPU tone mapper; `None` when the GL context can't run it.
+    hdr_gl: Option<hdr_gl::Shared>,
+    /// What the current file's metadata says, even if conversion is off.
+    hdr: Option<HdrInfo>,
+    /// The current video is requested as P010 and tone-mapped by us.
+    hdr_active: bool,
+    /// The newest frame is P010 (drawn by `hdr_gl` instead of `texture`).
+    hdr_frame: bool,
+    /// Set when an HDR video started; cleared by its first P010 frame.
+    hdr_wait: Option<Instant>,
+    /// Location for which libVLC failed to deliver P010 frames.
+    hdr_failed: Option<String>,
+
     playlist: Playlist,
     show_playlist: bool,
     selected: Option<usize>,
@@ -80,6 +102,8 @@ pub struct PlayerApp {
     store: Store,
     /// Saved position to jump to once the new media starts playing.
     resume_at: Option<i64>,
+    /// Don't announce the resume (the video was restarted on purpose).
+    resume_quietly: bool,
     last_save: Instant,
     /// Unused fraction of mouse-wheel notches (touchpads scroll in pixels).
     wheel_acc: f32,
@@ -97,6 +121,8 @@ impl PlayerApp {
             cc.egui_ctx.load_texture("app_icon", img, opts)
         });
 
+        let hdr_gl = cc.gl.as_ref().and_then(|gl| hdr_gl::Renderer::new(gl)).map(|r| Arc::new(Mutex::new(r)));
+
         let instance = Instance::new(&["--no-video-title-show", "--quiet"])?;
         let player = MediaPlayer::new(&instance)?;
 
@@ -104,6 +130,7 @@ impl PlayerApp {
         let sink = Arc::new(VideoSink::new(move || ctx.request_repaint()));
         let events = Arc::new(Events::default());
         *events.repaint.lock().unwrap() = Some(cc.egui_ctx.clone());
+        sink.set_player(player.handle());
         unsafe {
             player.set_video_callbacks(&sink.callbacks());
             player.attach_events(
@@ -121,6 +148,12 @@ impl PlayerApp {
             texture: None,
             frame_serial: 0,
             frame_size: (0.0, 0.0),
+            hdr_gl,
+            hdr: None,
+            hdr_active: false,
+            hdr_frame: false,
+            hdr_wait: None,
+            hdr_failed: None,
             playlist: Playlist::default(),
             // Opened with a file (e.g. from Explorer): go straight to the video.
             show_playlist: files.is_empty(),
@@ -139,6 +172,7 @@ impl PlayerApp {
             status: None,
             store,
             resume_at: None,
+            resume_quietly: false,
             last_save: Instant::now(),
             wheel_acc: 0.0,
             icon,
@@ -156,6 +190,14 @@ impl PlayerApp {
         self.remember_position();
         self.player.stop();
         self.sink.clear();
+        // libVLC doesn't report the transfer function, so read it ourselves.
+        self.hdr = if location.contains("://") { None } else { hdr::probe(Path::new(&location)) };
+        self.hdr_active = self.hdr.is_some()
+            && self.hdr_gl.is_some()
+            && !self.store.hdr_off
+            && self.hdr_failed.as_deref() != Some(location.as_str());
+        self.hdr_wait = None;
+        self.sink.set_format(if self.hdr_active { PixelFormat::P010 } else { PixelFormat::Rgba });
         if let Err(e) = self.player.set_media(&location) {
             self.notify(format!("Не удалось открыть: {e}"));
             return;
@@ -167,13 +209,47 @@ impl PlayerApp {
         self.seek_drag = None;
         self.pending_subtitles.clear();
         self.resume_at = self.store.position(&location);
+        self.resume_quietly = false;
         if !self.player.play() {
             self.notify("Не удалось начать воспроизведение");
         }
     }
 
+    /// Starts the current video again where it is (after an HDR mode change).
+    fn reload_current(&mut self) {
+        let Some(i) = self.playlist.current else { return };
+        let t = self.player.time();
+        self.play_index(i);
+        if t > 0 {
+            self.resume_at = Some(t);
+            self.resume_quietly = true;
+        }
+    }
+
+    fn set_hdr_conversion(&mut self, on: bool) {
+        if self.store.hdr_off == !on {
+            return;
+        }
+        self.store.set_hdr_off(!on);
+        self.store.save();
+        self.hdr_failed = None;
+        self.notify(if on { "Преобразование HDR: включено" } else { "Преобразование HDR: выключено" });
+        if self.hdr.is_some() {
+            self.reload_current();
+        }
+    }
+
+    /// Nits shown as white, from the brightness setting.
+    fn hdr_white(&self) -> f32 {
+        HDR_WHITE_NITS * 100.0 / self.store.hdr_brightness.unwrap_or(100) as f32
+    }
+
     fn is_active(&self) -> bool {
         self.playlist.current.is_some()
+    }
+
+    fn has_picture(&self) -> bool {
+        self.texture.is_some() || self.hdr_frame
     }
 
     fn toggle_pause(&mut self) {
@@ -376,8 +452,13 @@ impl PlayerApp {
             if let Some(ms) = self.resume_at.take() {
                 if self.player.is_seekable() && self.player.length().is_none_or(|l| ms < l) {
                     self.player.set_time(ms);
-                    self.notify(format!("Продолжаю с {}", format_time(ms)));
+                    if !self.resume_quietly {
+                        self.notify(format!("Продолжаю с {}", format_time(ms)));
+                    }
                 }
+            }
+            if self.hdr_active && !self.hdr_frame {
+                self.hdr_wait = Some(Instant::now());
             }
             if let (Some(i), Some(len)) = (self.playlist.current, self.player.length()) {
                 if let Some(item) = self.playlist.items.get_mut(i) {
@@ -408,10 +489,17 @@ impl PlayerApp {
         let serial = self.sink.with_frame(|f| f.serial);
         if serial != self.frame_serial {
             self.frame_serial = serial;
+            // P010 frames are uploaded by the HDR renderer while painting.
+            let (format, w, h) = self.sink.with_frame(|f| (f.format, f.width, f.height));
+            self.hdr_frame = w > 0 && format == PixelFormat::P010;
             let image = self.sink.with_frame(|f| {
-                (f.width > 0)
+                (f.width > 0 && f.format == PixelFormat::Rgba)
                     .then(|| egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.pixels))
             });
+            if self.hdr_frame {
+                self.hdr_wait = None;
+                self.frame_size = (w as f32, h as f32);
+            }
             match image {
                 Some(img) => {
                     self.frame_size = (img.size[0] as f32, img.size[1] as f32);
@@ -421,6 +509,14 @@ impl PlayerApp {
                     }
                 }
                 None => self.texture = None,
+            }
+        }
+        if self.hdr_wait.is_some_and(|t| t.elapsed() >= HDR_FRAME_TIMEOUT) && self.player.is_playing() {
+            self.hdr_wait = None;
+            if let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get(i)) {
+                self.hdr_failed = Some(item.location.clone());
+                self.reload_current();
+                self.notify("HDR: 10-битное видео не получилось, показываю как есть");
             }
         }
 
@@ -704,8 +800,53 @@ impl PlayerApp {
                     let speed = format!("{}×", trim_float(self.rate));
                     theme::menu_text(ui, &speed, "Скорость", |ui| self.speed_menu(ui));
                 });
+                if self.hdr.is_some() {
+                    theme::capsule(ui, |ui| {
+                        theme::menu_text(ui, "HDR", "HDR-видео", |ui| self.hdr_menu(ui));
+                    });
+                }
             });
         });
+    }
+
+    fn hdr_menu(&mut self, ui: &mut Ui) {
+        let Some(info) = self.hdr else { return };
+        let title = match info.transfer {
+            Transfer::Pq => format!("HDR10, пик {} нит", info.peak_nits.round()),
+            Transfer::Hlg => "HDR (HLG)".to_owned(),
+        };
+        ui.label(RichText::new(title).strong());
+        ui.set_min_width(220.0);
+        let on = !self.store.hdr_off;
+        let can = self.hdr_gl.is_some();
+        if ui
+            .add_enabled(can, egui::Button::selectable(on && can, "Преобразовывать в обычное (SDR)"))
+            .on_disabled_hover_text("Видеокарта не поддерживает 16-битные текстуры")
+            .clicked()
+        {
+            ui.close();
+            self.set_hdr_conversion(true);
+        }
+        if ui.add(egui::Button::selectable(!on || !can, "Показывать как есть")).clicked() {
+            ui.close();
+            self.set_hdr_conversion(false);
+        }
+        if on && can {
+            ui.separator();
+            let mut b = self.store.hdr_brightness.unwrap_or(100);
+            ui.horizontal(|ui| {
+                ui.label("Яркость");
+                if ui.add(egui::Slider::new(&mut b, HDR_BRIGHTNESS).step_by(5.0).suffix(" %")).changed() {
+                    self.store.set_hdr_brightness(b);
+                }
+                if b != 100 && ui.small_button("Сброс").clicked() {
+                    self.store.set_hdr_brightness(100);
+                }
+            });
+        }
+        if self.hdr_failed.is_some() && self.playlist.current.is_some() && !self.hdr_active {
+            ui.label(RichText::new("Не удалось получить 10-битные кадры").color(theme::TEXT_DIM).size(12.0));
+        }
     }
 
     fn open_menu(&mut self, ui: &mut Ui) {
@@ -1011,12 +1152,20 @@ impl PlayerApp {
         self.wheel_volume(ctx, rect);
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
 
-        if let Some(tex) = &self.texture {
+        if self.has_picture() {
             let (w, h) = self.frame_size;
             let uv = self.crop.uv_rect(w, h);
             let aspect = (uv.width() * w) / (uv.height() * h);
             let target = crop::fit(rect, aspect);
-            ui.painter().image(tex.id(), target, uv, Color32::WHITE);
+            match (&self.texture, &self.hdr_gl, self.hdr) {
+                (Some(tex), _, _) => {
+                    ui.painter().image(tex.id(), target, uv, Color32::WHITE);
+                }
+                (None, Some(renderer), Some(info)) => {
+                    hdr_gl::paint(ui, renderer, &self.sink, target, uv, info, self.hdr_white());
+                }
+                _ => {}
+            }
         } else if !self.is_active() {
             let c = rect.center() - vec2(0.0, 30.0);
             self.paint_app_icon(ui.painter(), Rect::from_center_size(c - vec2(0.0, 24.0), vec2(72.0, 72.0)));
@@ -1036,7 +1185,7 @@ impl PlayerApp {
 
         // Big play button in the middle while paused.
         let mut over_play = false;
-        if self.is_active() && !self.player.is_playing() && self.texture.is_some() {
+        if self.is_active() && !self.player.is_playing() && self.has_picture() {
             over_play = resp.hover_pos().is_some_and(|p| p.distance(rect.center()) <= 32.0);
             let shade = if over_play { 200 } else { 140 };
             ui.painter().circle_filled(rect.center(), 32.0, Color32::from_black_alpha(shade));
@@ -1064,6 +1213,9 @@ impl PlayerApp {
             ui.menu_button("Кадрирование", |ui| self.crop_menu(ui));
             ui.menu_button("Скорость", |ui| self.speed_menu(ui));
             ui.menu_button("Аудиоустройство", |ui| self.audio_device_menu(ui));
+            if self.hdr.is_some() {
+                ui.menu_button("HDR", |ui| self.hdr_menu(ui));
+            }
             ui.separator();
             if ui.button("Открыть файлы…").clicked() {
                 ui.close();

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="org.vplayer.app"
-    android:versionCode="3"
+    android:versionCode="4"
     android:versionName="0.1.0">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
@@ -22,7 +22,7 @@
     <application
         android:label="VPlayer"
         android:icon="@mipmap/ic_launcher"
-        android:hasCode="false"
+        android:hasCode="true"
         android:extractNativeLibs="true"
         android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">

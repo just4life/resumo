@@ -198,7 +198,9 @@ impl SurfaceVideo {
                 gl.delete_program(program);
                 return None;
             };
-            let layer = |st, oes| Layer { st, oes, last_stamp: i64::MIN, target: None, id: None };
+            // Before its first frame a `SurfaceTexture` says 0: nothing to
+            // copy yet (on some GPUs it would come out opaque black).
+            let layer = |st, oes| Layer { st, oes, last_stamp: 0, target: None, id: None };
             Some(Self {
                 awindow,
                 listener,

@@ -145,6 +145,60 @@ extern "C" {
     fn libvlc_audio_output_device_set(mp: *mut libvlc_media_player_t, module: *const c_char, device: *const c_char);
     fn libvlc_audio_output_device_get(mp: *mut libvlc_media_player_t) -> *mut c_char;
     fn libvlc_free(ptr: *mut c_void);
+
+    #[cfg(target_os = "android")]
+    fn libvlc_video_get_track(mp: *mut libvlc_media_player_t) -> c_int;
+    #[cfg(target_os = "android")]
+    fn libvlc_video_set_track(mp: *mut libvlc_media_player_t, id: c_int) -> c_int;
+    #[cfg(target_os = "android")]
+    fn libvlc_video_get_size(mp: *mut libvlc_media_player_t, num: c_uint, px: *mut c_uint, py: *mut c_uint) -> c_int;
+    #[cfg(target_os = "android")]
+    fn libvlc_media_player_get_media(mp: *mut libvlc_media_player_t) -> *mut libvlc_media_t;
+    #[cfg(target_os = "android")]
+    fn libvlc_media_tracks_get(md: *mut libvlc_media_t, tracks: *mut *mut *mut libvlc_media_track_t) -> c_uint;
+    #[cfg(target_os = "android")]
+    fn libvlc_media_tracks_release(tracks: *mut *mut libvlc_media_track_t, count: c_uint);
+}
+
+#[cfg(target_os = "android")]
+extern "C" {
+    fn libvlc_media_player_set_android_context(mp: *mut libvlc_media_player_t, awindow: *mut c_void);
+}
+
+/// `libvlc_media_track_t` (libVLC 3), as far as it is read here.
+#[cfg(target_os = "android")]
+#[repr(C)]
+struct libvlc_media_track_t {
+    codec: u32,
+    original_fourcc: u32,
+    id: c_int,
+    kind: c_int,
+    profile: c_int,
+    level: c_int,
+    detail: *mut c_void,
+}
+
+/// `libvlc_video_track_t`, its first fields.
+#[cfg(target_os = "android")]
+#[repr(C)]
+struct libvlc_video_track_t {
+    height: c_uint,
+    width: c_uint,
+}
+
+#[cfg(target_os = "android")]
+const TRACK_VIDEO: c_int = 1;
+
+/// The video track of the current media, as libVLC's demuxer found it.
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, Debug)]
+pub struct VideoInfo {
+    /// The codec's fourcc, such as `b"hevc"`.
+    pub codec: [u8; 4],
+    /// The codec profile, or -1 / 0 when unknown (2 is HEVC Main 10).
+    pub profile: i32,
+    pub width: u32,
+    pub height: u32,
 }
 
 fn last_error() -> String {
@@ -257,6 +311,66 @@ impl MediaPlayer {
             libvlc_video_set_mouse_input(raw, 0);
         }
         Ok(Self { raw, inst: instance.raw })
+    }
+
+    /// Sends the video to an Android surface through VLC's `AWindow` (a
+    /// global JNI reference to one), decoded straight into it.
+    ///
+    /// # Safety
+    /// `awindow` must stay valid while the player lives.
+    #[cfg(target_os = "android")]
+    pub unsafe fn set_android_window(&self, awindow: *mut c_void) {
+        libvlc_media_player_set_android_context(self.raw, awindow);
+    }
+
+    /// Starts the video track afresh, as on a new output window, from the
+    /// last keyframe so that the picture is back at once (paused too).
+    #[cfg(target_os = "android")]
+    pub fn restart_video(&self) {
+        unsafe {
+            let id = libvlc_video_get_track(self.raw);
+            if id >= 0 {
+                libvlc_video_set_track(self.raw, -1);
+                libvlc_video_set_track(self.raw, id);
+                if self.is_seekable() {
+                    self.set_time(self.time());
+                }
+            }
+        }
+    }
+
+    /// The decoded picture's size, once the video is playing.
+    #[cfg(target_os = "android")]
+    pub fn video_size(&self) -> Option<(u32, u32)> {
+        let (mut w, mut h) = (0, 0);
+        let ok = unsafe { libvlc_video_get_size(self.raw, 0, &mut w, &mut h) } == 0;
+        (ok && w > 0 && h > 0).then_some((w, h))
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn video_info(&self) -> Option<VideoInfo> {
+        unsafe {
+            let md = libvlc_media_player_get_media(self.raw);
+            if md.is_null() {
+                return None;
+            }
+            let mut tracks = std::ptr::null_mut();
+            let n = libvlc_media_tracks_get(md, &mut tracks);
+            let mut found = None;
+            for i in 0..n as usize {
+                let t = &**tracks.add(i);
+                if t.kind == TRACK_VIDEO && !t.detail.is_null() {
+                    let v = &*(t.detail as *const libvlc_video_track_t);
+                    found = Some(VideoInfo { codec: t.codec.to_le_bytes(), profile: t.profile, width: v.width, height: v.height });
+                    break;
+                }
+            }
+            if n > 0 {
+                libvlc_media_tracks_release(tracks, n);
+            }
+            libvlc_media_release(md);
+            found
+        }
     }
 
     /// # Safety

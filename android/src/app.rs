@@ -27,7 +27,9 @@ use crate::theme::{self, Icon};
 use crate::video::VideoSink;
 use crate::vlc::{self, Instance, MediaPlayer};
 #[cfg(target_os = "android")]
-use crate::zoom::{BarFinder, ViewSettings, Zoom};
+use crate::surface::{PROBE_H, PROBE_W};
+#[cfg(target_os = "android")]
+use crate::zoom::{BarFinder, Output, ViewSettings, Zoom};
 
 const SPEEDS: &[f32] = &[0.25, 0.5, 0.75, 1.0, 1.15, 1.25, 1.5, 1.75, 2.0, 3.0];
 const HIDE_CONTROLS_AFTER: Duration = Duration::from_millis(2500);
@@ -138,6 +140,18 @@ struct AndroidState {
     /// How the picture fills the screen, and whether black bars in the video are cut.
     view: ViewSettings,
     bars: BarFinder,
+    /// The hardware decoder's own output, when it could be set up.
+    gpu: Option<crate::surface::SurfaceVideo>,
+    /// The picture and subtitles it showed last frame.
+    gpu_picture: Option<(egui::TextureId, (f32, f32))>,
+    gpu_subtitles: Option<egui::TextureId>,
+    /// The picture is in the video layer (its size in `frame_size`).
+    layer_picture: bool,
+    /// Whether the current video is HDR (worked out once it plays).
+    hdr: Option<bool>,
+    gpu_serial: u64,
+    /// When to close the app after the video output was switched.
+    exit_at: Option<Instant>,
 }
 
 /// A finger sliding over the video: up and down on the left half sets the
@@ -181,7 +195,22 @@ impl PlayerApp {
             cc.egui_ctx.load_texture("app_icon", img, opts)
         });
 
-        let instance = Instance::new(&["--no-video-title-show", "--quiet"])?;
+        #[cfg(target_os = "android")]
+        let view = ViewSettings::load();
+        #[allow(unused_mut)]
+        let mut options = vec!["--no-video-title-show", "--quiet"];
+        // The phone's hardware decoder: libVLC only uses it when asked (as
+        // VLC for Android does); without it the CPU decodes, which heats the
+        // phone and drains the battery with 4K.
+        #[cfg(target_os = "android")]
+        options.push("--codec=mediacodec_ndk,mediacodec_jni,all");
+        // Straight to the surface (see `surface`), OpenGL only when that
+        // can't open.
+        #[cfg(target_os = "android")]
+        if view.output != Output::Cpu {
+            options.push("--vout=android_display,any");
+        }
+        let instance = Instance::new(&options)?;
         let player = MediaPlayer::new(&instance)?;
         #[cfg(target_os = "android")]
         let pauser = player.pauser();
@@ -199,8 +228,26 @@ impl PlayerApp {
         let sink = Arc::new(VideoSink::new(move || ctx.request_repaint()));
         let events = Arc::new(Events::default());
         *events.repaint.lock().unwrap() = Some(cc.egui_ctx.clone());
+        // The decoder draws into a surface of its own; copying frames through
+        // the CPU is the fallback.
+        #[cfg(target_os = "android")]
+        let gpu = cc
+            .gl
+            .as_ref()
+            .filter(|_| view.output != Output::Cpu)
+            .and_then(|gl| crate::surface::SurfaceVideo::new(gl, (1080, 1920), view.output == Output::Layer));
+        #[cfg(target_os = "android")]
+        let gpu_ok = gpu.is_some();
+        #[cfg(not(target_os = "android"))]
+        let gpu_ok = false;
         unsafe {
-            player.set_video_callbacks(&sink.callbacks());
+            #[cfg(target_os = "android")]
+            if let Some(g) = &gpu {
+                player.set_android_window(g.awindow());
+            }
+            if !gpu_ok {
+                player.set_video_callbacks(&sink.callbacks());
+            }
             player.attach_events(
                 &[vlc::EVENT_END_REACHED, vlc::EVENT_ERROR, vlc::EVENT_PLAYING],
                 on_vlc_event,
@@ -257,8 +304,15 @@ impl PlayerApp {
                 pip_checked: Instant::now(),
                 pip_sent: None,
                 history: History::load(),
-                view: ViewSettings::load(),
+                view,
                 bars: BarFinder::default(),
+                gpu,
+                gpu_picture: None,
+                gpu_subtitles: None,
+                layer_picture: false,
+                hdr: None,
+                gpu_serial: 0,
+                exit_at: None,
             },
         };
         app.add_paths(files, true);
@@ -607,13 +661,141 @@ impl PlayerApp {
     /// In the picture-in-picture window there is room for the picture only.
     #[cfg(target_os = "android")]
     fn pip_view(&mut self, ui: &mut Ui) {
-        let rect = ui.max_rect();
+        // Inside the window's shadow margins, which are left clear (with the
+        // video layer, whose window can be see-through).
+        let full = ui.max_rect();
+        let (x, y) = crate::surface::window_inset();
+        let rect = full.shrink2(vec2(x, y) / ui.ctx().pixels_per_point());
+        if self.android.layer_picture {
+            ui.painter().add(crate::surface::hole(full));
+        }
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
-        if let Some(tex) = &self.texture {
+        if self.shows_picture() {
             let (w, h) = self.frame_size;
             let uv = self.picture_uv();
             let target = crop::fit(rect, (uv.width() * w) / (uv.height() * h));
-            ui.painter().image(tex.id(), target, uv, Color32::WHITE);
+            match self.picture_texture().filter(|_| !self.android.layer_picture) {
+                Some(id) => {
+                    ui.painter().image(id, target, uv, Color32::WHITE);
+                }
+                None => self.show_layer(&ui.painter().clone(), rect, target, uv, ui.ctx().pixels_per_point()),
+            }
+        }
+    }
+
+    /// The picture's texture: from the decoder's surface, or the frames
+    /// copied through the CPU. (In the video layer there is none.)
+    #[cfg(target_os = "android")]
+    fn picture_texture(&self) -> Option<egui::TextureId> {
+        self.android.gpu_picture.map(|(id, _)| id).or_else(|| self.texture.as_ref().map(|t| t.id()))
+    }
+
+    /// A picture of the video is on screen: in a texture, or in the video
+    /// layer.
+    #[cfg(target_os = "android")]
+    fn shows_picture(&self) -> bool {
+        self.android.layer_picture || self.picture_texture().is_some()
+    }
+
+    /// Shows the video layer under the window: the whole picture placed so
+    /// that its `uv` part fills `target`, with the window see-through where
+    /// `target` is inside `area` (the painter's black there stays around it).
+    #[cfg(target_os = "android")]
+    fn show_layer(&mut self, painter: &egui::Painter, area: Rect, target: Rect, uv: Rect, ppp: f32) {
+        let shown = target.intersect(area);
+        if shown.is_positive() {
+            let mut p = painter.clone();
+            p.set_clip_rect(shown.intersect(painter.clip_rect()));
+            p.add(crate::surface::hole(shown));
+        }
+        let size = target.size() / uv.size();
+        let min = target.min - uv.min.to_vec2() * size;
+        let px = |v: f32| (v * ppp).round() as i32;
+        if let Some(g) = &mut self.android.gpu {
+            g.place_layer([px(min.x), px(min.y), px(size.x), px(size.y)]);
+        }
+    }
+
+    /// Whether the current video looks like HDR10: 10-bit HEVC, VP9 or AV1
+    /// at 4K-ish sizes (SDR 10-bit encodes are mostly smaller).
+    #[cfg(target_os = "android")]
+    fn looks_hdr(&self) -> bool {
+        let Some(v) = self.player.video_info() else { return false };
+        let codec = matches!(&v.codec, b"hevc" | b"VP90" | b"av01");
+        let height = v.height.max(self.frame_size.1 as u32);
+        codec && if v.profile == 2 { height >= 1440 } else { height >= 2000 }
+    }
+
+    /// Takes the decoder's newest frames into the GPU textures (see
+    /// [`crate::surface`]), and looks for black bars in them.
+    #[cfg(target_os = "android")]
+    fn gpu_frame(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(at) = self.android.exit_at {
+            if Instant::now() >= at {
+                self.remember_position();
+                self.store.save();
+                std::process::exit(0);
+            }
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+        let Some(gl) = frame.gl().cloned() else { return };
+        if self.android.gpu.is_none() {
+            return;
+        }
+        if !self.is_active() {
+            // A late frame of what was stopped must not show.
+            self.android.gpu_picture = None;
+            self.android.gpu_subtitles = None;
+            self.android.layer_picture = false;
+            return;
+        }
+        let serial = self.sink.with_frame(|f| f.serial);
+        if serial != self.android.gpu_serial {
+            // Stopped, or another file: nothing of it is on screen yet.
+            self.android.gpu_serial = serial;
+            self.android.hdr = None;
+            if let Some(g) = &mut self.android.gpu {
+                g.reset();
+            }
+        }
+        let size = self.player.video_size();
+        if self.android.hdr.is_none() && size.is_some() {
+            self.android.hdr = Some(self.looks_hdr());
+        }
+        let hdr = self.android.view.hdr_to_sdr.unwrap_or(self.android.hdr == Some(true));
+        let r = ctx.viewport_rect();
+        let ppp = ctx.pixels_per_point();
+        let window = ((r.width() * ppp).round() as i32, (r.height() * ppp).round() as i32);
+        let Some(gpu) = &mut self.android.gpu else { return };
+        let shown = gpu.frame(&gl, frame, window, size, hdr);
+        let layer = gpu.is_layer();
+        let layer_size = gpu.picture_size().or(size.map(|(w, h)| (w as f32, h as f32)));
+        self.android.layer_picture = layer && size.is_some();
+        if shown.reattached {
+            self.player.restart_video();
+        }
+        if let Some(s) = layer_size.filter(|_| self.android.layer_picture) {
+            self.frame_size = s;
+        }
+        self.android.gpu_picture = shown.picture;
+        self.android.gpu_subtitles = shown.subtitles;
+        if let Some((_, s)) = shown.picture {
+            self.frame_size = s;
+        }
+        if self.android.view.cut_bars && self.shows_picture() && self.android.bars.due() {
+            let pixels = self.android.gpu.as_mut().and_then(|g| g.probe(&gl));
+            if let Some(px) = pixels {
+                self.android.bars.feed(crate::zoom::find_bars(&px, PROBE_W, PROBE_H));
+            }
+        }
+        // No callback says a frame is ready: look for one often. In the
+        // video layer the picture needs no drawing, only the subtitles do.
+        if self.player.is_playing() {
+            if layer {
+                ctx.request_repaint_after(Duration::from_millis(40));
+            } else {
+                ctx.request_repaint();
+            }
         }
     }
 
@@ -661,7 +843,7 @@ impl PlayerApp {
             egui::Popup::close_all(ctx);
         } else if self.fullscreen {
             self.set_fullscreen(ctx, false);
-        } else if self.player.is_playing() && self.texture.is_some() {
+        } else if self.player.is_playing() && self.shows_picture() {
             platform::enter_pip(self.pip_aspect(), self.player.is_playing());
         } else {
             platform::move_to_back();
@@ -789,14 +971,15 @@ impl PlayerApp {
                 self.android.keep_screen_on = playing;
                 platform::set_keep_screen_on(playing);
             }
-            self.android.guard.tick(playing && self.texture.is_some());
+            self.android.guard.tick(playing && self.shows_picture());
+            // (With the decoder's own output, in `gpu_frame`.)
             if self.android.view.cut_bars && self.texture.is_some() {
                 self.android.bars.update(&self.sink);
             }
             // Going Home with a video playing turns it into a small window,
             // whose button shows pause or play.
-            let video = playing && self.texture.is_some();
-            let aspect = if self.texture.is_some() { self.pip_aspect() } else { None };
+            let video = playing && self.shows_picture();
+            let aspect = if self.shows_picture() { self.pip_aspect() } else { None };
             let pip = (aspect, video, playing);
             if self.android.pip_sent != Some(pip) {
                 self.android.pip_sent = Some(pip);
@@ -804,7 +987,7 @@ impl PlayerApp {
             }
             if self.android.pip_checked.elapsed() > Duration::from_millis(300) {
                 self.android.pip_checked = Instant::now();
-                platform::refresh_cutout();
+                platform::refresh_insets();
                 // A press is read (and dropped) even out of the small window,
                 // so a late one can't pause the video the next time.
                 let pressed = platform::pip_button_pressed();
@@ -1235,6 +1418,8 @@ impl PlayerApp {
                 self.notify(if cut { "Чёрные полосы убираются" } else { "Чёрные полосы не убираются" });
             }
             ui.separator();
+            self.output_menu(ui);
+            ui.separator();
         }
         ui.label(RichText::new("Кадрирование").strong());
         if ui.add(egui::Button::selectable(self.crop == Crop::None, "Без кадрирования")).clicked() {
@@ -1261,6 +1446,37 @@ impl PlayerApp {
                     ui.label(label);
                     ui.add(egui::Slider::new(v, 0.0..=45.0).suffix(" %").fixed_decimals(0));
                     ui.end_row();
+                }
+            });
+        }
+    }
+
+    /// How the video gets on screen, for a phone where the video layer
+    /// doesn't work; and HDR to SDR, for the picture drawn by the app.
+    #[cfg(target_os = "android")]
+    fn output_menu(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Вывод видео").strong());
+        ui.horizontal_wrapped(|ui| {
+            for (output, name) in Output::ALL {
+                let on = self.android.view.output == output;
+                if ui.add(egui::Button::selectable(on, name)).clicked() && !on {
+                    self.android.view.output = output;
+                    self.android.view.save();
+                    self.notify(format!("Вывод видео: {name}\nПриложение закроется, откройте его снова"));
+                    self.android.exit_at = Some(Instant::now() + Duration::from_secs(3));
+                }
+            }
+        });
+        let drawn = self.android.gpu.as_ref().is_some_and(|g| !g.is_layer());
+        if drawn {
+            ui.horizontal(|ui| {
+                ui.label("HDR в SDR");
+                let auto = format!("Авто ({})", if self.android.hdr == Some(true) { "вкл" } else { "выкл" });
+                for (value, name) in [(None, auto.as_str()), (Some(true), "Вкл"), (Some(false), "Выкл")] {
+                    if ui.add(egui::Button::selectable(self.android.view.hdr_to_sdr == value, name)).clicked() {
+                        self.android.view.hdr_to_sdr = value;
+                        self.android.view.save();
+                    }
                 }
             });
         }
@@ -1587,10 +1803,14 @@ impl PlayerApp {
             (r, p)
         };
 
-        if let Some(tex) = &self.texture {
+        #[cfg(not(target_os = "android"))]
+        let shows_picture = self.texture.is_some();
+        #[cfg(target_os = "android")]
+        let shows_picture = self.shows_picture();
+        if shows_picture {
             let (w, h) = self.frame_size;
             #[cfg(not(target_os = "android"))]
-            {
+            if let Some(tex) = &self.texture {
                 let uv = self.crop.uv_rect(w, h);
                 let aspect = (uv.width() * w) / (uv.height() * h);
                 let target = crop::fit(rect, aspect);
@@ -1602,7 +1822,19 @@ impl PlayerApp {
                 let uv = self.eased_picture_uv(ctx);
                 let aspect = (uv.width() * w) / (uv.height() * h);
                 let target = self.android.view.zoom.place(picture_area, aspect);
-                picture_painter.image(tex.id(), target, uv, Color32::WHITE);
+                match self.picture_texture().filter(|_| !self.android.layer_picture) {
+                    Some(id) => {
+                        picture_painter.image(id, target, uv, Color32::WHITE);
+                    }
+                    None => self.show_layer(&picture_painter, picture_area, target, uv, ctx.pixels_per_point()),
+                }
+                // libVLC lays the subtitles out over the whole picture: shown
+                // where the whole picture would fit, so that zooming in
+                // doesn't push them off the screen.
+                if let Some(subs) = self.android.gpu_subtitles {
+                    let full = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                    picture_painter.image(subs, crop::fit(picture_area, w / h), full, Color32::WHITE);
+                }
             }
         } else if !self.is_active() && !self.has_recent() {
             let c = rect.center() - vec2(0.0, 30.0);
@@ -1626,11 +1858,11 @@ impl PlayerApp {
         }
 
         #[cfg(target_os = "android")]
-        if self.texture.is_none() && !self.is_active() && self.has_recent() {
+        if !shows_picture && !self.is_active() && self.has_recent() {
             self.recent_on_video(ui, rect);
         }
 
-        if self.is_active() && !self.player.is_playing() && self.texture.is_some() {
+        if self.is_active() && !self.player.is_playing() && shows_picture {
             ui.painter().circle_filled(rect.center(), 30.0, Color32::from_black_alpha(140));
             let icon = Rect::from_center_size(rect.center() + vec2(2.0, 0.0), vec2(24.0, 24.0));
             theme::paint_icon(ui.painter(), icon, Icon::Play, Color32::WHITE);
@@ -2006,6 +2238,13 @@ enum RowAction {
 }
 
 impl eframe::App for PlayerApp {
+    /// Opaque: the window is see-through only where the video layer's
+    /// picture is (see `show_layer`).
+    #[cfg(target_os = "android")]
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 1.0]
+    }
+
     /// When Android takes a touch over (a system gesture, a window on top),
     /// winit reports it as cancelled and egui only hears "pointer gone", so it
     /// would think the finger is still down: the drag never ends and the next
@@ -2029,10 +2268,11 @@ impl eframe::App for PlayerApp {
             }
             i += 1;
         }
-        // The camera cutout: egui's content rect leaves it out, so windows
-        // and menus stay clear of it (the root panels too, see `ui`).
+        // The camera cutout and the taskbar: egui's content rect leaves them
+        // out, so windows and menus stay clear of them (the root panels too,
+        // see `ui`).
         let ppp = ctx.pixels_per_point();
-        let [left, top, right, bottom] = platform::cutout().map(|px| px / ppp);
+        let [left, top, right, bottom] = platform::safe_insets().map(|px| px / ppp);
         raw_input.safe_area_insets = Some(egui::SafeAreaInsets(egui::epaint::MarginF32 { left, right, top, bottom }));
     }
 
@@ -2061,6 +2301,8 @@ impl eframe::App for PlayerApp {
                 .show_separator_line(false)
                 .show(ui, |ui| self.title_bar(ui, &ctx));
         }
+        #[cfg(target_os = "android")]
+        self.gpu_frame(&ctx, frame);
         #[cfg(target_os = "android")]
         if self.android.pip {
             egui::CentralPanel::no_frame().show(ui, |ui| self.pip_view(ui));

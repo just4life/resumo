@@ -123,6 +123,7 @@ extern "C" {
         cleanup: Option<libvlc_video_cleanup_cb>,
     );
     fn libvlc_video_set_key_input(mp: *mut libvlc_media_player_t, on: c_uint);
+    fn libvlc_video_get_size(mp: *mut libvlc_media_player_t, num: c_uint, px: *mut c_uint, py: *mut c_uint) -> c_int;
     fn libvlc_video_set_mouse_input(mp: *mut libvlc_media_player_t, on: c_uint);
     fn libvlc_video_get_spu(mp: *mut libvlc_media_player_t) -> c_int;
     fn libvlc_video_set_spu(mp: *mut libvlc_media_player_t, id: c_int) -> c_int;
@@ -236,6 +237,23 @@ pub struct MediaPlayer {
     inst: *mut libvlc_instance_t,
 }
 
+/// Lets the video callbacks ask the player about the current video.
+#[derive(Clone, Copy)]
+pub struct PlayerHandle(*mut libvlc_media_player_t);
+
+// SAFETY: libVLC's media player functions are thread-safe.
+unsafe impl Send for PlayerHandle {}
+unsafe impl Sync for PlayerHandle {}
+
+impl PlayerHandle {
+    /// Picture size as the container reports it (without decoder padding).
+    pub fn video_size(&self) -> Option<(u32, u32)> {
+        let (mut w, mut h) = (0, 0);
+        let ok = unsafe { libvlc_video_get_size(self.0, 0, &mut w, &mut h) } == 0;
+        (ok && w > 0 && h > 0).then_some((w, h))
+    }
+}
+
 impl MediaPlayer {
     pub fn new(instance: &Instance) -> Result<Self, String> {
         let raw = unsafe { libvlc_media_player_new(instance.raw) };
@@ -248,6 +266,11 @@ impl MediaPlayer {
             libvlc_video_set_mouse_input(raw, 0);
         }
         Ok(Self { raw, inst: instance.raw })
+    }
+
+    /// Valid as long as this player is.
+    pub fn handle(&self) -> PlayerHandle {
+        PlayerHandle(self.raw)
     }
 
     /// # Safety

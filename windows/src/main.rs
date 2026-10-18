@@ -4,6 +4,8 @@
 
 mod app;
 mod crop;
+mod hdr;
+mod hdr_gl;
 mod playlist;
 mod store;
 mod taskbar;

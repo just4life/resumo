@@ -1,8 +1,8 @@
 //! How the picture fills the video area (Android): whole, filling the
 //! screen, by width or by height, plus cutting off black bars that are part
 //! of the video itself (a film letterboxed into a 16:9 or 4:3 frame), found
-//! by looking at the frames. The choice is kept in `zoom.txt` in the app's
-//! private folder.
+//! by looking at the frames; and how the video gets on screen. The choices
+//! are kept in `zoom.txt` in the app's private folder.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -55,17 +55,52 @@ impl Zoom {
     }
 }
 
+/// How the video gets on screen (a change takes effect on the next start).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Output {
+    /// The decoder's own video layer under the interface, as in VLC: HDR
+    /// video shows as HDR.
+    #[default]
+    Layer,
+    /// The decoder's frames drawn by the app through the GPU (HDR turned
+    /// into SDR).
+    Texture,
+    /// Frames copied through the CPU.
+    Cpu,
+}
+
+impl Output {
+    pub const ALL: [(Output, &'static str); 3] =
+        [(Output::Layer, "Видеослой (HDR)"), (Output::Texture, "Видеокарта"), (Output::Cpu, "Процессор")];
+
+    pub fn label(self) -> &'static str {
+        Self::ALL.iter().find(|(o, _)| *o == self).map_or("", |(_, n)| n)
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Output::Layer => "layer",
+            Output::Texture => "texture",
+            Output::Cpu => "cpu",
+        }
+    }
+}
+
 pub struct ViewSettings {
     pub zoom: Zoom,
     /// Cut off black bars found in the video.
     pub cut_bars: bool,
+    /// Turn HDR video into SDR (drawn through the GPU only): `None` decides
+    /// from the video.
+    pub hdr_to_sdr: Option<bool>,
+    pub output: Output,
     dir: Option<PathBuf>,
 }
 
 impl ViewSettings {
     pub fn load() -> Self {
         let dir = store::config_dir();
-        let mut s = Self { zoom: Zoom::Fit, cut_bars: false, dir };
+        let mut s = Self { zoom: Zoom::Fit, cut_bars: false, hdr_to_sdr: None, output: Output::Layer, dir };
         let text = s.dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("zoom.txt")).ok()).unwrap_or_default();
         for line in text.lines() {
             match line.split_once('=') {
@@ -73,6 +108,10 @@ impl ViewSettings {
                     s.zoom = Zoom::ALL.iter().map(|(z, _)| *z).find(|z| z.key() == v).unwrap_or(Zoom::Fit)
                 }
                 Some(("cut_bars", v)) => s.cut_bars = v == "1",
+                Some(("hdr", v)) => s.hdr_to_sdr = match v { "on" => Some(true), "off" => Some(false), _ => None },
+                Some(("video_out", v)) => {
+                    s.output = Output::ALL.iter().map(|(o, _)| *o).find(|o| o.key() == v).unwrap_or_default()
+                }
                 _ => {}
             }
         }
@@ -82,7 +121,17 @@ impl ViewSettings {
     pub fn save(&self) {
         let Some(dir) = &self.dir else { return };
         let _ = std::fs::create_dir_all(dir);
-        let text = format!("zoom={}\ncut_bars={}\n", self.zoom.key(), self.cut_bars as u8);
+        let hdr = match self.hdr_to_sdr {
+            Some(true) => "on",
+            Some(false) => "off",
+            None => "auto",
+        };
+        let text = format!(
+            "zoom={}\ncut_bars={}\nhdr={hdr}\nvideo_out={}\n",
+            self.zoom.key(),
+            self.cut_bars as u8,
+            self.output.key()
+        );
         let _ = std::fs::write(dir.join("zoom.txt"), text);
     }
 }
@@ -183,13 +232,24 @@ impl BarFinder {
     /// Looks at the newest frame now and then (while paused, the same frame
     /// again, which confirms itself).
     pub fn update(&mut self, sink: &VideoSink) {
+        if self.due() {
+            if let Some(found) = sink.with_frame(|f| (f.width > 0).then(|| find_bars(&f.pixels, f.width, f.height))) {
+                self.feed(found);
+            }
+        }
+    }
+
+    /// Whether it is time to look at a frame again (then [`Self::feed`] it
+    /// what [`find_bars`] made of one).
+    pub fn due(&mut self) -> bool {
         if self.checked.elapsed() < CHECK_EVERY {
-            return;
+            return false;
         }
         self.checked = Instant::now();
-        let Some(found) = sink.with_frame(|f| (f.width > 0).then(|| find_bars(&f.pixels, f.width, f.height))) else {
-            return;
-        };
+        true
+    }
+
+    pub fn feed(&mut self, found: Option<Rect>) {
         let Some(found) = found else {
             self.candidate = None;
             return;

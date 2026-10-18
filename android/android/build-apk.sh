@@ -57,9 +57,19 @@ rm -rf "$stage"
 mkdir -p "$stage/lib/$ABI" "$stage/res"
 cp "$work/$triple/release/libvplayer.so" "$vlc_libs/libvlc.so" "$vlc_libs/libc++_shared.so" "$stage/lib/$ABI/"
 
+# libVLC's Java part: only its AWindow is used, the surface libVLC draws the
+# hardware decoder's frames into (see src/surface.rs). The app's own code
+# stays in the Rust library.
+if [ ! -f "$vlc_dir/classes.dex" ]; then
+    aar="${VLC_AAR:-$work/libvlc-all-$VLC_VERSION.aar}"
+    unzip -qo "$aar" classes.jar -d "$vlc_dir"
+    "$BUILD_TOOLS/d8" --release --min-api "$API" --lib "$PLATFORM_JAR" --output "$vlc_dir" "$vlc_dir/classes.jar"
+fi
+cp "$vlc_dir/classes.dex" "$stage/"
+
 "$BUILD_TOOLS/aapt2" compile --dir res -o "$stage/res.zip"
 "$BUILD_TOOLS/aapt2" link -o "$stage/base.apk" -I "$PLATFORM_JAR" --manifest AndroidManifest.xml "$stage/res.zip"
-(cd "$stage" && zip -qr base.apk lib)
+(cd "$stage" && zip -qr base.apk lib classes.dex)
 "$BUILD_TOOLS/zipalign" -f -p 4 "$stage/base.apk" "$stage/aligned.apk"
 
 # A fixed key, so a new APK installs over the previous one.
