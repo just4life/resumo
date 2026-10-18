@@ -118,4 +118,4 @@ ANDROID_HOME=/путь/к/sdk bash android/build-apk.sh
 
 ## Лицензия
 
-GPL-2.0-or-later. Плеер использует libVLC (LGPL-2.1+) без изменений: готовую сборку VideoLAN для Android (`org.videolan.android:libvlc-all`) или установленный VLC на компьютере. Всё, что плеер настраивает в libVLC, это параметры запуска в коде (например, аппаратный декодер и вывод видео на Android TV) от [VideoLAN](https://www.videolan.org/).
+GPL-2.0-or-later. Плеер использует libVLC от [VideoLAN](https://www.videolan.org/) (LGPL-2.1+) без изменений: готовую сборку для Android (`org.videolan.android:libvlc-all`) или установленный VLC на компьютере. Плеер только передаёт libVLC параметры запуска из своего кода, например включает аппаратный декодер и вывод видео на Android TV.
