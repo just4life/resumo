@@ -6,10 +6,11 @@
 
 **Простой видеоплеер без лишнего. Только то, что нужно, чтобы смотреть.**
 
-Тёмный современный интерфейс, движок VLC внутри, одна программа для Windows, Linux и Android.
+Тёмный современный интерфейс, движок VLC внутри, одна программа для Windows, Linux, Android и Android TV.
 
 ![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011-0078D6?style=flat-square&logo=windows&logoColor=white)
 ![Android](https://img.shields.io/badge/Android-7%2B-3DDC84?style=flat-square&logo=android&logoColor=white)
+![Android TV](https://img.shields.io/badge/Android%20TV-7%2B-34A853?style=flat-square&logo=androidtv&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-x64-FCC624?style=flat-square&logo=linux&logoColor=black)
 ![Rust](https://img.shields.io/badge/Rust-egui-CE422B?style=flat-square&logo=rust&logoColor=white)
 ![libVLC](https://img.shields.io/badge/движок-libVLC%203-FF8800?style=flat-square&logo=vlcmediaplayer&logoColor=white)
@@ -64,6 +65,18 @@ VLC умеет открыть почти что угодно, но его инт
 
 Подробности в [android/README.md](android/README.md).
 
+### На Android TV
+
+Отдельное приложение **VPlayer TV** для телевизоров и приставок Android TV / Google TV, всё управляется пультом:
+
+- 📺 главный экран с плитками «Файлы», «Сеть», «Ссылка» и рядом «Продолжить просмотр»;
+- 💾 USB-флешки и жёсткие диски, DLNA и SMB в локальной сети;
+- 🎮 кнопки пульта и геймпада: пауза, перемотка, следующий файл;
+- 🌈 аппаратное декодирование 4K и вывод HDR10 на телевизор как есть;
+- ⌨️ своя экранная клавиатура (русская и английская раскладки).
+
+Подробности в [android-tv/README.md](android-tv/README.md). Версия ещё дорабатывается, в первую очередь воспроизведение 4K HDR.
+
 ## Что в репозитории
 
 Это форк [VLC](https://code.videolan.org/videolan/vlc). Исходный код самого VLC не изменён и лежит в ветке [`master`](../../tree/master), а в этой ветке находится только плеер:
@@ -72,6 +85,7 @@ VLC умеет открыть почти что угодно, но его инт
 |---|---|
 | [`windows/`](windows/) | настольная версия: Windows, Linux (и macOS, не проверялась) |
 | [`android/`](android/) | версия для Android 7+ (arm64) |
+| [`android-tv/`](android-tv/) | версия для Android TV / Google TV 7+ (ARM 32 и 64 бита) |
 
 Весь код плеера написан на Rust, интерфейс сделан на egui. К libVLC плеер обращается напрямую через C API, без Java на Android и без C++.
 
@@ -93,8 +107,15 @@ cd android
 ANDROID_HOME=/путь/к/sdk bash android/build-apk.sh
 ```
 
+**Android TV**
+
+```sh
+cd android-tv
+ANDROID_HOME=/путь/к/sdk bash android/build-apk.sh
+```
+
 Полные инструкции в README каждой папки.
 
 ## Лицензия
 
-GPL-2.0-or-later. Плеер использует libVLC (LGPL-2.1+) от [VideoLAN](https://www.videolan.org/).
+GPL-2.0-or-later. Плеер использует libVLC (LGPL-2.1+) без изменений: готовую сборку VideoLAN для Android (`org.videolan.android:libvlc-all`) или установленный VLC на компьютере. Всё, что плеер настраивает в libVLC, это параметры запуска в коде (например, аппаратный декодер и вывод видео на Android TV) от [VideoLAN](https://www.videolan.org/).

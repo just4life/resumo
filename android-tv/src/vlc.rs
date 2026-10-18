@@ -1,0 +1,678 @@
+//! Minimal hand-written bindings to libVLC 3.x and safe wrappers around them.
+//!
+//! Only the subset of the API the player needs is declared here, so the crate
+//! has no C code, no bindgen step and no `-sys` dependency: it links directly
+//! against the `libvlc` shared library shipped with VLC.
+
+#![allow(non_camel_case_types)]
+
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+
+pub type libvlc_time_t = i64;
+
+#[repr(C)]
+pub struct libvlc_instance_t {
+    _p: [u8; 0],
+}
+#[repr(C)]
+pub struct libvlc_media_t {
+    _p: [u8; 0],
+}
+#[repr(C)]
+pub struct libvlc_media_player_t {
+    _p: [u8; 0],
+}
+#[repr(C)]
+pub struct libvlc_event_manager_t {
+    _p: [u8; 0],
+}
+
+#[repr(C)]
+pub struct libvlc_track_description_t {
+    pub i_id: c_int,
+    pub psz_name: *mut c_char,
+    pub p_next: *mut libvlc_track_description_t,
+}
+
+#[repr(C)]
+pub struct libvlc_audio_output_device_t {
+    pub p_next: *mut libvlc_audio_output_device_t,
+    pub psz_device: *mut c_char,
+    pub psz_description: *mut c_char,
+}
+
+/// Only the leading `type` field is read; the rest of the event union is ignored.
+#[repr(C)]
+pub struct libvlc_event_t {
+    pub type_: c_int,
+    pub p_obj: *mut c_void,
+}
+
+pub type libvlc_callback_t = unsafe extern "C" fn(event: *const libvlc_event_t, data: *mut c_void);
+pub type libvlc_video_lock_cb = unsafe extern "C" fn(opaque: *mut c_void, planes: *mut *mut c_void) -> *mut c_void;
+pub type libvlc_video_unlock_cb =
+    unsafe extern "C" fn(opaque: *mut c_void, picture: *mut c_void, planes: *const *mut c_void);
+pub type libvlc_video_display_cb = unsafe extern "C" fn(opaque: *mut c_void, picture: *mut c_void);
+pub type libvlc_video_format_cb = unsafe extern "C" fn(
+    opaque: *mut *mut c_void,
+    chroma: *mut c_char,
+    width: *mut c_uint,
+    height: *mut c_uint,
+    pitches: *mut c_uint,
+    lines: *mut c_uint,
+) -> c_uint;
+pub type libvlc_video_cleanup_cb = unsafe extern "C" fn(opaque: *mut c_void);
+
+#[cfg(target_os = "android")]
+type libvlc_media_open_cb = unsafe extern "C" fn(opaque: *mut c_void, datap: *mut *mut c_void, sizep: *mut u64) -> c_int;
+#[cfg(target_os = "android")]
+type libvlc_media_read_cb = unsafe extern "C" fn(opaque: *mut c_void, buf: *mut u8, len: usize) -> isize;
+#[cfg(target_os = "android")]
+type libvlc_media_seek_cb = unsafe extern "C" fn(opaque: *mut c_void, offset: u64) -> c_int;
+#[cfg(target_os = "android")]
+type libvlc_media_close_cb = unsafe extern "C" fn(opaque: *mut c_void);
+
+/// Something libVLC reads a media from, instead of opening it itself.
+#[cfg(target_os = "android")]
+pub trait Stream: Send {
+    /// Fills the start of `buf`; `Some(0)` at the end, `None` on an error.
+    fn read(&mut self, buf: &mut [u8]) -> Option<usize>;
+    fn seek(&mut self, offset: u64) -> bool;
+}
+
+/// Opens a [`Stream`] (and gives its size) each time libVLC opens the media.
+#[cfg(target_os = "android")]
+pub type OpenStream = Box<dyn Fn() -> Option<(Box<dyn Stream>, u64)> + Send + Sync>;
+
+pub const EVENT_PLAYING: c_int = 0x104;
+pub const EVENT_END_REACHED: c_int = 0x109;
+pub const EVENT_ERROR: c_int = 0x10A;
+
+const SLAVE_TYPE_SUBTITLE: c_int = 0;
+
+#[cfg_attr(windows, link(name = "libvlc"))]
+#[cfg_attr(not(windows), link(name = "vlc"))]
+extern "C" {
+    fn libvlc_new(argc: c_int, argv: *const *const c_char) -> *mut libvlc_instance_t;
+    fn libvlc_release(inst: *mut libvlc_instance_t);
+    fn libvlc_retain(inst: *mut libvlc_instance_t);
+    fn libvlc_errmsg() -> *const c_char;
+    fn libvlc_get_version() -> *const c_char;
+
+    fn libvlc_media_new_path(inst: *mut libvlc_instance_t, path: *const c_char) -> *mut libvlc_media_t;
+    fn libvlc_media_new_location(inst: *mut libvlc_instance_t, mrl: *const c_char) -> *mut libvlc_media_t;
+    fn libvlc_media_release(md: *mut libvlc_media_t);
+    #[cfg(target_os = "android")]
+    fn libvlc_media_new_callbacks(
+        inst: *mut libvlc_instance_t,
+        open: libvlc_media_open_cb,
+        read: libvlc_media_read_cb,
+        seek: Option<libvlc_media_seek_cb>,
+        close: Option<libvlc_media_close_cb>,
+        opaque: *mut c_void,
+    ) -> *mut libvlc_media_t;
+    #[cfg(target_os = "android")]
+    fn libvlc_media_slaves_add(md: *mut libvlc_media_t, type_: c_int, priority: c_uint, uri: *const c_char) -> c_int;
+    fn libvlc_media_add_option(md: *mut libvlc_media_t, option: *const c_char);
+
+    fn libvlc_media_player_new(inst: *mut libvlc_instance_t) -> *mut libvlc_media_player_t;
+    fn libvlc_media_player_release(mp: *mut libvlc_media_player_t);
+    fn libvlc_media_player_set_media(mp: *mut libvlc_media_player_t, md: *mut libvlc_media_t);
+    fn libvlc_media_player_event_manager(mp: *mut libvlc_media_player_t) -> *mut libvlc_event_manager_t;
+    fn libvlc_media_player_is_playing(mp: *mut libvlc_media_player_t) -> c_int;
+    fn libvlc_media_player_play(mp: *mut libvlc_media_player_t) -> c_int;
+    fn libvlc_media_player_set_pause(mp: *mut libvlc_media_player_t, do_pause: c_int);
+    fn libvlc_media_player_stop(mp: *mut libvlc_media_player_t);
+    fn libvlc_media_player_get_length(mp: *mut libvlc_media_player_t) -> libvlc_time_t;
+    fn libvlc_media_player_get_time(mp: *mut libvlc_media_player_t) -> libvlc_time_t;
+    fn libvlc_media_player_set_time(mp: *mut libvlc_media_player_t, t: libvlc_time_t);
+    fn libvlc_media_player_get_position(mp: *mut libvlc_media_player_t) -> f32;
+    fn libvlc_media_player_set_position(mp: *mut libvlc_media_player_t, pos: f32);
+    fn libvlc_media_player_set_rate(mp: *mut libvlc_media_player_t, rate: f32) -> c_int;
+    fn libvlc_media_player_is_seekable(mp: *mut libvlc_media_player_t) -> c_int;
+    fn libvlc_media_player_add_slave(
+        mp: *mut libvlc_media_player_t,
+        type_: c_int,
+        uri: *const c_char,
+        select: bool,
+    ) -> c_int;
+
+    fn libvlc_event_attach(
+        em: *mut libvlc_event_manager_t,
+        type_: c_int,
+        cb: libvlc_callback_t,
+        data: *mut c_void,
+    ) -> c_int;
+
+    fn libvlc_video_set_callbacks(
+        mp: *mut libvlc_media_player_t,
+        lock: libvlc_video_lock_cb,
+        unlock: Option<libvlc_video_unlock_cb>,
+        display: Option<libvlc_video_display_cb>,
+        opaque: *mut c_void,
+    );
+    fn libvlc_video_set_format_callbacks(
+        mp: *mut libvlc_media_player_t,
+        setup: libvlc_video_format_cb,
+        cleanup: Option<libvlc_video_cleanup_cb>,
+    );
+    fn libvlc_video_set_key_input(mp: *mut libvlc_media_player_t, on: c_uint);
+    fn libvlc_video_set_mouse_input(mp: *mut libvlc_media_player_t, on: c_uint);
+    fn libvlc_video_get_spu(mp: *mut libvlc_media_player_t) -> c_int;
+    fn libvlc_video_set_spu(mp: *mut libvlc_media_player_t, id: c_int) -> c_int;
+    #[cfg(target_os = "android")]
+    fn libvlc_video_get_track(mp: *mut libvlc_media_player_t) -> c_int;
+    #[cfg(target_os = "android")]
+    fn libvlc_video_set_track(mp: *mut libvlc_media_player_t, id: c_int) -> c_int;
+    fn libvlc_video_get_spu_description(mp: *mut libvlc_media_player_t) -> *mut libvlc_track_description_t;
+    fn libvlc_video_set_spu_delay(mp: *mut libvlc_media_player_t, delay_us: i64) -> c_int;
+
+    fn libvlc_audio_get_track_description(mp: *mut libvlc_media_player_t) -> *mut libvlc_track_description_t;
+    fn libvlc_audio_get_track(mp: *mut libvlc_media_player_t) -> c_int;
+    fn libvlc_audio_set_track(mp: *mut libvlc_media_player_t, id: c_int) -> c_int;
+    fn libvlc_audio_set_volume(mp: *mut libvlc_media_player_t, volume: c_int) -> c_int;
+    fn libvlc_audio_set_mute(mp: *mut libvlc_media_player_t, mute: c_int);
+    fn libvlc_audio_set_delay(mp: *mut libvlc_media_player_t, delay_us: i64) -> c_int;
+
+    fn libvlc_track_description_list_release(list: *mut libvlc_track_description_t);
+
+    fn libvlc_audio_output_device_enum(mp: *mut libvlc_media_player_t) -> *mut libvlc_audio_output_device_t;
+    fn libvlc_audio_output_device_list_release(list: *mut libvlc_audio_output_device_t);
+    fn libvlc_audio_output_device_set(mp: *mut libvlc_media_player_t, module: *const c_char, device: *const c_char);
+    fn libvlc_audio_output_device_get(mp: *mut libvlc_media_player_t) -> *mut c_char;
+    fn libvlc_free(ptr: *mut c_void);
+
+    #[cfg(target_os = "android")]
+    fn libvlc_video_get_size(mp: *mut libvlc_media_player_t, num: c_uint, px: *mut c_uint, py: *mut c_uint) -> c_int;
+    #[cfg(target_os = "android")]
+    fn libvlc_media_player_get_media(mp: *mut libvlc_media_player_t) -> *mut libvlc_media_t;
+    #[cfg(target_os = "android")]
+    fn libvlc_media_tracks_get(md: *mut libvlc_media_t, tracks: *mut *mut *mut libvlc_media_track_t) -> c_uint;
+    #[cfg(target_os = "android")]
+    fn libvlc_media_tracks_release(tracks: *mut *mut libvlc_media_track_t, count: c_uint);
+}
+
+#[cfg(target_os = "android")]
+extern "C" {
+    fn libvlc_media_player_set_android_context(mp: *mut libvlc_media_player_t, awindow: *mut c_void);
+}
+
+/// `libvlc_media_track_t` (libVLC 3), as far as it is read here.
+#[cfg(target_os = "android")]
+#[repr(C)]
+struct libvlc_media_track_t {
+    codec: u32,
+    original_fourcc: u32,
+    id: c_int,
+    kind: c_int,
+    profile: c_int,
+    level: c_int,
+    detail: *mut c_void,
+}
+
+/// `libvlc_video_track_t`, its first fields.
+#[cfg(target_os = "android")]
+#[repr(C)]
+struct libvlc_video_track_t {
+    height: c_uint,
+    width: c_uint,
+}
+
+#[cfg(target_os = "android")]
+const TRACK_VIDEO: c_int = 1;
+
+/// The video track of the current media, as libVLC's demuxer found it.
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, Debug)]
+pub struct VideoInfo {
+    /// The codec's fourcc, such as `b"hevc"`.
+    pub codec: [u8; 4],
+    /// The codec profile, or -1 / 0 when unknown (2 is HEVC Main 10).
+    pub profile: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+fn last_error() -> String {
+    unsafe {
+        let p = libvlc_errmsg();
+        if p.is_null() {
+            "unknown libVLC error".to_owned()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    }
+}
+
+pub fn version() -> String {
+    unsafe { CStr::from_ptr(libvlc_get_version()).to_string_lossy().into_owned() }
+}
+
+/// A libVLC engine instance.
+pub struct Instance {
+    pub(crate) raw: *mut libvlc_instance_t,
+}
+
+impl Instance {
+    pub fn new(args: &[&str]) -> Result<Self, String> {
+        let owned: Vec<CString> = args.iter().map(|a| CString::new(*a).unwrap()).collect();
+        let argv: Vec<*const c_char> = owned.iter().map(|a| a.as_ptr()).collect();
+        let raw = unsafe { libvlc_new(argv.len() as c_int, argv.as_ptr()) };
+        if raw.is_null() {
+            Err(last_error())
+        } else {
+            Ok(Self { raw })
+        }
+    }
+}
+
+impl Clone for Instance {
+    fn clone(&self) -> Self {
+        unsafe { libvlc_retain(self.raw) };
+        Self { raw: self.raw }
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        unsafe { libvlc_release(self.raw) }
+    }
+}
+
+/// A single audio or subtitle track as reported by libVLC.
+#[derive(Clone, Debug)]
+pub struct Track {
+    pub id: i32,
+    pub name: String,
+}
+
+unsafe fn collect_tracks(list: *mut libvlc_track_description_t) -> Vec<Track> {
+    let mut out = Vec::new();
+    let mut cur = list;
+    while !cur.is_null() {
+        let t = &*cur;
+        let name = if t.psz_name.is_null() {
+            format!("Track {}", t.i_id)
+        } else {
+            CStr::from_ptr(t.psz_name).to_string_lossy().into_owned()
+        };
+        out.push(Track { id: t.i_id, name });
+        cur = t.p_next;
+    }
+    if !list.is_null() {
+        libvlc_track_description_list_release(list);
+    }
+    out
+}
+
+/// An audio output device (speakers, headphones, HDMI, ...).
+#[derive(Clone, Debug)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+}
+
+/// The video output hooks a [`MediaPlayer`] renders into.
+///
+/// # Safety
+/// `opaque` must stay valid until the player is released, and the callbacks
+/// must be safe to call from libVLC's video output thread.
+pub struct VideoCallbacks {
+    pub format: libvlc_video_format_cb,
+    pub cleanup: Option<libvlc_video_cleanup_cb>,
+    pub lock: libvlc_video_lock_cb,
+    pub unlock: Option<libvlc_video_unlock_cb>,
+    pub display: Option<libvlc_video_display_cb>,
+    pub opaque: *mut c_void,
+}
+
+pub struct MediaPlayer {
+    raw: *mut libvlc_media_player_t,
+    inst: *mut libvlc_instance_t,
+    /// What the current callbacks media opens its stream with.
+    #[cfg(target_os = "android")]
+    source: std::cell::RefCell<Option<Box<OpenStream>>>,
+}
+
+impl MediaPlayer {
+    pub fn new(instance: &Instance) -> Result<Self, String> {
+        let raw = unsafe { libvlc_media_player_new(instance.raw) };
+        if raw.is_null() {
+            return Err(last_error());
+        }
+        unsafe {
+            // Keyboard and mouse belong to our UI, not to VLC's video window.
+            libvlc_video_set_key_input(raw, 0);
+            libvlc_video_set_mouse_input(raw, 0);
+        }
+        Ok(Self {
+            raw,
+            inst: instance.raw,
+            #[cfg(target_os = "android")]
+            source: Default::default(),
+        })
+    }
+
+    /// Sends the video to an Android surface through VLC's `AWindow` (a
+    /// global JNI reference to one), decoded straight into it.
+    ///
+    /// # Safety
+    /// `awindow` must stay valid while the player lives.
+    #[cfg(target_os = "android")]
+    pub unsafe fn set_android_window(&self, awindow: *mut c_void) {
+        libvlc_media_player_set_android_context(self.raw, awindow);
+    }
+
+    /// Starts the video track afresh, as on a new output window, from the
+    /// last keyframe so that the picture is back at once (paused too).
+    #[cfg(target_os = "android")]
+    pub fn restart_video(&self) {
+        unsafe {
+            let id = libvlc_video_get_track(self.raw);
+            if id >= 0 {
+                libvlc_video_set_track(self.raw, -1);
+                libvlc_video_set_track(self.raw, id);
+                if self.is_seekable() {
+                    self.set_time(self.time());
+                }
+            }
+        }
+    }
+
+    /// The decoded picture's size, once the video is playing.
+    #[cfg(target_os = "android")]
+    pub fn video_size(&self) -> Option<(u32, u32)> {
+        let (mut w, mut h) = (0, 0);
+        let ok = unsafe { libvlc_video_get_size(self.raw, 0, &mut w, &mut h) } == 0;
+        (ok && w > 0 && h > 0).then_some((w, h))
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn video_info(&self) -> Option<VideoInfo> {
+        unsafe {
+            let md = libvlc_media_player_get_media(self.raw);
+            if md.is_null() {
+                return None;
+            }
+            let mut tracks = std::ptr::null_mut();
+            let n = libvlc_media_tracks_get(md, &mut tracks);
+            let mut found = None;
+            for i in 0..n as usize {
+                let t = &**tracks.add(i);
+                if t.kind == TRACK_VIDEO && !t.detail.is_null() {
+                    let v = &*(t.detail as *const libvlc_video_track_t);
+                    found = Some(VideoInfo { codec: t.codec.to_le_bytes(), profile: t.profile, width: v.width, height: v.height });
+                    break;
+                }
+            }
+            if n > 0 {
+                libvlc_media_tracks_release(tracks, n);
+            }
+            libvlc_media_release(md);
+            found
+        }
+    }
+
+    /// # Safety
+    /// See [`VideoCallbacks`].
+    pub unsafe fn set_video_callbacks(&self, cb: &VideoCallbacks) {
+        libvlc_video_set_callbacks(self.raw, cb.lock, cb.unlock, cb.display, cb.opaque);
+        libvlc_video_set_format_callbacks(self.raw, cb.format, cb.cleanup);
+    }
+
+    /// Registers `cb` for each event type in `events`.
+    ///
+    /// # Safety
+    /// `data` must stay valid until the player is released. The callback runs
+    /// on a libVLC thread and must not call back into libVLC.
+    pub unsafe fn attach_events(&self, events: &[c_int], cb: libvlc_callback_t, data: *mut c_void) {
+        let em = libvlc_media_player_event_manager(self.raw);
+        for &e in events {
+            libvlc_event_attach(em, e, cb, data);
+        }
+    }
+
+    /// Loads a local path or a URL (anything with `://`), with libVLC
+    /// options for it such as `:smb-user=…`.
+    pub fn set_media(&self, location: &str, options: &[String]) -> Result<(), String> {
+        let c = CString::new(location).map_err(|e| e.to_string())?;
+        unsafe {
+            let md = if location.contains("://") {
+                libvlc_media_new_location(self.inst, c.as_ptr())
+            } else {
+                libvlc_media_new_path(self.inst, c.as_ptr())
+            };
+            if md.is_null() {
+                return Err(last_error());
+            }
+            for o in options {
+                if let Ok(o) = CString::new(o.as_str()) {
+                    libvlc_media_add_option(md, o.as_ptr());
+                }
+            }
+            libvlc_media_player_set_media(self.raw, md);
+            libvlc_media_release(md);
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::set_media`], with libVLC reading through `open`'s
+    /// stream; `subtitles` are subtitle file URIs to load with it. Call it
+    /// with the player stopped.
+    #[cfg(target_os = "android")]
+    pub fn set_media_stream(&self, open: OpenStream, options: &[String], subtitles: &[String]) -> Result<(), String> {
+        unsafe extern "C" fn open_cb(opaque: *mut c_void, datap: *mut *mut c_void, sizep: *mut u64) -> c_int {
+            let open = &*(opaque as *const OpenStream);
+            match open() {
+                Some((stream, size)) => {
+                    *datap = Box::into_raw(Box::new(stream)) as *mut c_void;
+                    *sizep = size;
+                    0
+                }
+                None => {
+                    *datap = std::ptr::null_mut();
+                    -1
+                }
+            }
+        }
+        unsafe extern "C" fn read_cb(opaque: *mut c_void, buf: *mut u8, len: usize) -> isize {
+            let stream = &mut *(opaque as *mut Box<dyn Stream>);
+            stream.read(std::slice::from_raw_parts_mut(buf, len)).map_or(-1, |n| n as isize)
+        }
+        unsafe extern "C" fn seek_cb(opaque: *mut c_void, offset: u64) -> c_int {
+            let stream = &mut *(opaque as *mut Box<dyn Stream>);
+            if stream.seek(offset) { 0 } else { -1 }
+        }
+        unsafe extern "C" fn close_cb(opaque: *mut c_void) {
+            if !opaque.is_null() {
+                drop(Box::from_raw(opaque as *mut Box<dyn Stream>));
+            }
+        }
+        let open = Box::new(open);
+        unsafe {
+            let opaque = &*open as *const OpenStream as *mut c_void;
+            let md = libvlc_media_new_callbacks(self.inst, open_cb, read_cb, Some(seek_cb), Some(close_cb), opaque);
+            if md.is_null() {
+                return Err(last_error());
+            }
+            for o in options {
+                if let Ok(o) = CString::new(o.as_str()) {
+                    libvlc_media_add_option(md, o.as_ptr());
+                }
+            }
+            for uri in subtitles {
+                if let Ok(c) = CString::new(uri.as_str()) {
+                    libvlc_media_slaves_add(md, SLAVE_TYPE_SUBTITLE, 4, c.as_ptr());
+                }
+            }
+            libvlc_media_player_set_media(self.raw, md);
+            libvlc_media_release(md);
+        }
+        // The previous media, stopped, reads no more from its source.
+        *self.source.borrow_mut() = Some(open);
+        Ok(())
+    }
+
+    pub fn play(&self) -> bool {
+        unsafe { libvlc_media_player_play(self.raw) == 0 }
+    }
+    pub fn set_pause(&self, pause: bool) {
+        unsafe { libvlc_media_player_set_pause(self.raw, pause as c_int) }
+    }
+    pub fn stop(&self) {
+        unsafe { libvlc_media_player_stop(self.raw) }
+    }
+    pub fn is_playing(&self) -> bool {
+        unsafe { libvlc_media_player_is_playing(self.raw) != 0 }
+    }
+    pub fn is_seekable(&self) -> bool {
+        unsafe { libvlc_media_player_is_seekable(self.raw) != 0 }
+    }
+    /// Media length in milliseconds, or `None` when unknown.
+    pub fn length(&self) -> Option<i64> {
+        let l = unsafe { libvlc_media_player_get_length(self.raw) };
+        (l > 0).then_some(l)
+    }
+    pub fn time(&self) -> i64 {
+        unsafe { libvlc_media_player_get_time(self.raw) }.max(0)
+    }
+    pub fn set_time(&self, ms: i64) {
+        unsafe { libvlc_media_player_set_time(self.raw, ms.max(0)) }
+    }
+    pub fn position(&self) -> f32 {
+        unsafe { libvlc_media_player_get_position(self.raw) }.max(0.0)
+    }
+    pub fn set_position(&self, pos: f32) {
+        unsafe { libvlc_media_player_set_position(self.raw, pos.clamp(0.0, 1.0)) }
+    }
+    pub fn set_rate(&self, rate: f32) {
+        unsafe {
+            libvlc_media_player_set_rate(self.raw, rate);
+        }
+    }
+
+    pub fn set_volume(&self, v: i32) {
+        unsafe {
+            libvlc_audio_set_volume(self.raw, v.clamp(0, 200));
+        }
+    }
+    pub fn set_mute(&self, mute: bool) {
+        unsafe { libvlc_audio_set_mute(self.raw, mute as c_int) }
+    }
+
+    pub fn audio_tracks(&self) -> Vec<Track> {
+        unsafe { collect_tracks(libvlc_audio_get_track_description(self.raw)) }
+    }
+    pub fn audio_track(&self) -> i32 {
+        unsafe { libvlc_audio_get_track(self.raw) }
+    }
+    pub fn set_audio_track(&self, id: i32) {
+        unsafe {
+            libvlc_audio_set_track(self.raw, id);
+        }
+    }
+    pub fn set_audio_delay_ms(&self, ms: i64) {
+        unsafe {
+            libvlc_audio_set_delay(self.raw, ms * 1000);
+        }
+    }
+
+    pub fn subtitle_tracks(&self) -> Vec<Track> {
+        unsafe { collect_tracks(libvlc_video_get_spu_description(self.raw)) }
+    }
+    pub fn subtitle_track(&self) -> i32 {
+        unsafe { libvlc_video_get_spu(self.raw) }
+    }
+    pub fn set_subtitle_track(&self, id: i32) {
+        unsafe {
+            libvlc_video_set_spu(self.raw, id);
+        }
+    }
+    pub fn set_subtitle_delay_ms(&self, ms: i64) {
+        unsafe {
+            libvlc_video_set_spu_delay(self.raw, ms * 1000);
+        }
+    }
+    /// Devices of the current audio output. Usually empty until playback
+    /// has started, because the output is created with the first media.
+    pub fn audio_devices(&self) -> Vec<AudioDevice> {
+        let mut out = Vec::new();
+        unsafe {
+            let list = libvlc_audio_output_device_enum(self.raw);
+            let mut cur = list;
+            while !cur.is_null() {
+                let d = &*cur;
+                if !d.psz_device.is_null() {
+                    let id = CStr::from_ptr(d.psz_device).to_string_lossy().into_owned();
+                    let name = if d.psz_description.is_null() {
+                        id.clone()
+                    } else {
+                        CStr::from_ptr(d.psz_description).to_string_lossy().into_owned()
+                    };
+                    out.push(AudioDevice { id, name });
+                }
+                cur = d.p_next;
+            }
+            if !list.is_null() {
+                libvlc_audio_output_device_list_release(list);
+            }
+        }
+        out
+    }
+    pub fn audio_device(&self) -> Option<String> {
+        unsafe {
+            let p = libvlc_audio_output_device_get(self.raw);
+            if p.is_null() {
+                return None;
+            }
+            let id = CStr::from_ptr(p).to_string_lossy().into_owned();
+            libvlc_free(p as *mut c_void);
+            Some(id)
+        }
+    }
+    pub fn set_audio_device(&self, id: &str) {
+        if let Ok(c) = CString::new(id) {
+            unsafe { libvlc_audio_output_device_set(self.raw, std::ptr::null(), c.as_ptr()) }
+        }
+    }
+
+    /// A handle that pauses this player from another thread. It must not be
+    /// called after the player is dropped.
+    #[cfg(target_os = "android")]
+    pub fn pauser(&self) -> impl Fn() + Send + 'static {
+        let raw = self.raw as usize;
+        move || unsafe { libvlc_media_player_set_pause(raw as *mut libvlc_media_player_t, 1) }
+    }
+
+    /// Loads an external subtitle file into the current media and selects it.
+    pub fn add_subtitle_file(&self, uri: &str) -> bool {
+        let Ok(c) = CString::new(uri) else { return false };
+        unsafe { libvlc_media_player_add_slave(self.raw, SLAVE_TYPE_SUBTITLE, c.as_ptr(), true) == 0 }
+    }
+
+}
+
+impl Drop for MediaPlayer {
+    fn drop(&mut self) {
+        unsafe {
+            libvlc_media_player_stop(self.raw);
+            libvlc_media_player_release(self.raw);
+        }
+    }
+}
+
+/// Converts a local path into a `file://` URI that libVLC accepts for slaves.
+pub fn path_to_uri(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::from("file://");
+    if !s.starts_with('/') {
+        out.push('/');
+    }
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
