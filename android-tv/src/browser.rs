@@ -81,6 +81,8 @@ enum Row {
     Address,
     Server(usize),
     NetEntry(usize),
+    /// A remembered network login; OK forgets it.
+    SavedLogin(usize),
 }
 
 pub struct Browser {
@@ -117,6 +119,8 @@ struct NetView {
     loaded_at: Option<Instant>,
     polled_at: Instant,
     servers: Vec<NetItem>,
+    /// Servers a login is remembered for (`lan::saved_logins`).
+    logins: Vec<String>,
     address: String,
     /// After going up: the folder we came from, to put the focus back on it.
     came_from: Option<String>,
@@ -143,6 +147,7 @@ impl NetView {
             loaded_at: None,
             polled_at: Instant::now(),
             servers,
+            logins: lan::saved_logins(),
             address: "smb://".to_owned(),
             came_from: None,
         }
@@ -182,6 +187,7 @@ impl NetView {
         self.polled_at = Instant::now();
         let Some(listing) = &self.listing else {
             self.servers = self.lan.servers();
+            self.logins = lan::saved_logins();
             return;
         };
         if self.loaded_at.is_some_and(|t| t.elapsed() > Duration::from_secs(5)) {
@@ -378,6 +384,7 @@ impl Browser {
             if net.stack.is_empty() {
                 rows.push(Row::Address);
                 rows.extend((0..net.servers.len()).map(Row::Server));
+                rows.extend((0..net.logins.len()).map(Row::SavedLogin));
             } else {
                 if net.items.iter().any(|i| !i.is_dir) {
                     rows.push(Row::WholeFolder);
@@ -541,6 +548,14 @@ impl Browser {
                     }
                 }
             }
+            Row::SavedLogin(i) => {
+                if let Some(net) = &mut self.net {
+                    if let Some(server) = net.logins.get(i) {
+                        lan::forget_login(server);
+                    }
+                    net.logins = lan::saved_logins();
+                }
+            }
             Row::NetEntry(i) => {
                 let Some(net) = &mut self.net else { return Action::None };
                 let Some(item) = net.items.get(i).cloned() else { return Action::None };
@@ -687,6 +702,11 @@ impl Browser {
             Row::Server(i) => {
                 let Some(net) = &self.net else { return };
                 tv::row(p, r, Some((Icon::Network, theme::ACCENT)), &net.servers[i].name, Trail::None, focused, false)
+            }
+            Row::SavedLogin(i) => {
+                let Some(net) = &self.net else { return };
+                let label = format!("Пароль для {}", net.logins[i]);
+                tv::row(p, r, Some((Icon::Close, theme::TEXT_DIM)), &label, Trail::Text("OK — забыть"), focused, false)
             }
             Row::NetEntry(i) => {
                 let Some(net) = &self.net else { return };
