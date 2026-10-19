@@ -560,12 +560,32 @@ fn save_login(server: String, login: Login) {
     with_logins(|logins| {
         logins.retain(|(s, _)| *s != server);
         logins.push((server, login));
-        let text: String =
-            logins.iter().map(|(s, l)| format!("{s}\t{}\t{}\n", escape(&l.user), escape(&l.pass))).collect();
-        if let Some(path) = logins_file() {
-            let _ = std::fs::write(path, text);
-        }
+        write_logins(logins);
     });
+}
+
+/// The servers a login is remembered for ("smb://nas").
+pub fn saved_logins() -> Vec<String> {
+    with_logins(|logins| logins.iter().map(|(s, _)| s.clone()).collect())
+}
+
+/// Forgets the login remembered for `server` (as [`saved_logins`] gives it).
+pub fn forget_login(server: &str) {
+    with_logins(|logins| {
+        logins.retain(|(s, _)| s != server);
+        write_logins(logins);
+    });
+}
+
+fn write_logins(logins: &[(String, Login)]) {
+    let Some(path) = logins_file() else { return };
+    if logins.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let text: String =
+        logins.iter().map(|(s, l)| format!("{s}\t{}\t{}\n", escape(&l.user), escape(&l.pass))).collect();
+    let _ = std::fs::write(path, text);
 }
 
 fn escape(s: &str) -> String {

@@ -491,6 +491,21 @@ fn network_section(ui: &mut Ui, net: &mut NetView, play: bool, selecting: &mut b
                     open = Some(s.clone());
                 }
             }
+            let saved = lan::saved_logins();
+            if !saved.is_empty() {
+                ui.add_space(12.0);
+                ui.label(RichText::new("Сохранённые пароли").color(theme::TEXT_DIM).size(12.5));
+                for server in saved {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&server).color(theme::TEXT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(egui::Button::new("Забыть").min_size(vec2(88.0, 34.0))).clicked() {
+                                lan::forget_login(&server);
+                            }
+                        });
+                    });
+                }
+            }
             return;
         }
         match net.state {

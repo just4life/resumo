@@ -150,69 +150,86 @@ pub fn sdk_int() -> i32 {
     })
 }
 
-/// Whether the app may read the shared storage (every file on Android 11+).
+/// Whether the app may read the shared storage: every file (Android 11+
+/// "All files access"), or at least videos and music, when "All files
+/// access" was refused or the phone has no page for it.
 pub fn has_storage_access() -> bool {
-    if sdk_int() >= 30 {
-        with_env(|env, _| env.call_static_method("android/os/Environment", "isExternalStorageManager", "()Z", &[])?.z())
-            .unwrap_or(false)
+    let all_files = sdk_int() >= 30
+        && with_env(|env, _| env.call_static_method("android/os/Environment", "isExternalStorageManager", "()Z", &[])?.z())
+            .unwrap_or(false);
+    all_files || media_permissions().iter().all(|p| permission_granted(p))
+}
+
+/// The runtime permissions that give access to videos and music.
+fn media_permissions() -> &'static [&'static str] {
+    if sdk_int() >= 33 {
+        &["android.permission.READ_MEDIA_VIDEO", "android.permission.READ_MEDIA_AUDIO"]
     } else {
-        with_env(|env, activity| {
-            let perm = env.new_string("android.permission.READ_EXTERNAL_STORAGE")?;
-            let r = env.call_method(activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[JValue::Object(&perm)])?;
-            Ok(r.i()? == 0)
-        })
-        .unwrap_or(false)
+        &["android.permission.READ_EXTERNAL_STORAGE"]
     }
 }
 
-/// Asks for storage access: the "All files access" settings page on
-/// Android 11+, the permission dialog on older versions.
-pub fn request_storage_access() {
-    if sdk_int() >= 30 {
-        let opened = with_env(|env, activity| {
+fn permission_granted(name: &str) -> bool {
+    with_env(|env, activity| {
+        let perm = env.new_string(name)?;
+        let r = env.call_method(activity, "checkSelfPermission", "(Ljava/lang/String;)I", &[JValue::Object(&perm)])?;
+        Ok(r.i()? == 0)
+    })
+    .unwrap_or(false)
+}
+
+/// Starts the settings screen for `action` (with `package:` data when
+/// `for_app`), if this device has one.
+fn open_settings(action: &str, for_app: bool) -> bool {
+    with_env(|env, activity| {
+        let action = env.new_string(action)?;
+        let intent = env.new_object("android/content/Intent", "(Ljava/lang/String;)V", &[JValue::Object(&action)])?;
+        if for_app {
             let pkg = env.call_method(activity, "getPackageName", "()Ljava/lang/String;", &[])?.l()?;
             let pkg = env.get_string(&JString::from(pkg))?.to_string_lossy().into_owned();
             let uri_str = env.new_string(format!("package:{pkg}"))?;
             let uri = env
-                .call_static_method(
-                    "android/net/Uri",
-                    "parse",
-                    "(Ljava/lang/String;)Landroid/net/Uri;",
-                    &[JValue::Object(&uri_str)],
-                )?
+                .call_static_method("android/net/Uri", "parse", "(Ljava/lang/String;)Landroid/net/Uri;", &[JValue::Object(&uri_str)])?
                 .l()?;
-            let action = env.new_string("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION")?;
-            let intent = env.new_object(
-                "android/content/Intent",
-                "(Ljava/lang/String;Landroid/net/Uri;)V",
-                &[JValue::Object(&action), JValue::Object(&uri)],
-            )?;
-            env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
-            Ok(())
-        });
-        if opened.is_none() {
-            // Some firmwares only have the general list of apps.
-            with_env(|env, activity| {
-                let action = env.new_string("android.settings.MANAGE_ALL_FILES_ACCESS_PERMISSION")?;
-                let intent = env.new_object("android/content/Intent", "(Ljava/lang/String;)V", &[JValue::Object(&action)])?;
-                env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
-                Ok(())
-            });
+            env.call_method(&intent, "setData", "(Landroid/net/Uri;)Landroid/content/Intent;", &[JValue::Object(&uri)])?;
         }
-    } else {
-        with_env(|env, activity| {
-            let perms = env.new_object_array(2, "java/lang/String", JObject::null())?;
-            for (i, p) in ["android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"]
-                .iter()
-                .enumerate()
-            {
-                let s = env.new_string(p)?;
-                env.set_object_array_element(&perms, i as i32, s)?;
-            }
-            env.call_method(activity, "requestPermissions", "([Ljava/lang/String;I)V", &[JValue::Object(&perms), JValue::Int(1)])?;
-            Ok(())
-        });
+        let pm = env.call_method(activity, "getPackageManager", "()Landroid/content/pm/PackageManager;", &[])?.l()?;
+        let target = env
+            .call_method(&intent, "resolveActivity", "(Landroid/content/pm/PackageManager;)Landroid/content/ComponentName;", &[JValue::Object(&pm)])?
+            .l()?;
+        if target.is_null() {
+            return Ok(false);
+        }
+        env.call_method(activity, "startActivity", "(Landroid/content/Intent;)V", &[JValue::Object(&intent)])?;
+        Ok(true)
+    })
+    .unwrap_or(false)
+}
+
+/// Asks for storage access: the "All files access" settings page on
+/// Android 11+ where the device has it, otherwise the permission dialog for
+/// videos and music.
+pub fn request_storage_access() {
+    // The first time, the "All files access" page; if that didn't give
+    // access (or the phone has no such page), the permission dialog next time.
+    static TRIED_SETTINGS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if sdk_int() >= 30
+        && !TRIED_SETTINGS.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && (open_settings("android.settings.MANAGE_APP_ALL_FILES_ACCESS_PERMISSION", true)
+            || open_settings("android.settings.MANAGE_ALL_FILES_ACCESS_PERMISSION", false))
+    {
+        return;
     }
+    let perms = media_permissions();
+    with_env(|env, activity| {
+        let arr = env.new_object_array(perms.len() as i32, "java/lang/String", JObject::null())?;
+        for (i, p) in perms.iter().enumerate() {
+            let s = env.new_string(p)?;
+            env.set_object_array_element(&arr, i as i32, s)?;
+        }
+        env.call_method(activity, "requestPermissions", "([Ljava/lang/String;I)V", &[JValue::Object(&arr), JValue::Int(1)])?;
+        Ok(())
+    });
 }
 
 /// Keeps the screen on while video plays. A screen wake lock is used rather

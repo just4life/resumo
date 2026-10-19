@@ -1,0 +1,46 @@
+# Builds and tests every version on each push and pull request. The desktop
+# crates are tested on Linux against the distribution's libVLC; the Android
+# libraries are only type-checked (packaging an APK needs the SDK, NDK and
+# the libVLC AAR, see android/android/build-apk.sh).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [windows, android, android-tv]
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libvlc-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+      - run: cargo test --locked
+        working-directory: ${{ matrix.crate }}
+
+  android:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [android/android, android-tv/android]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.crate }}
+      - run: cargo check --locked --target aarch64-linux-android
+        working-directory: ${{ matrix.crate }}

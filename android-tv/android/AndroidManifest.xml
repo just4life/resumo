@@ -35,6 +35,7 @@
         android:hasCode="true"
         android:extractNativeLibs="true"
         android:requestLegacyExternalStorage="true"
+        android:allowBackup="false"
         android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
 
         <activity
