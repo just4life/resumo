@@ -153,6 +153,28 @@ pub fn sdk_int() -> i32 {
     })
 }
 
+/// Local wall-clock time as minutes since midnight, `ahead_ms` from now.
+/// The zone offset comes from Java's default `TimeZone` (the TV's setting),
+/// asked again each minute so a change or DST shows up.
+pub fn local_minutes(ahead_ms: i64) -> i64 {
+    static OFFSET: std::sync::Mutex<Option<(Instant, i64)>> = std::sync::Mutex::new(None);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64);
+    let mut cached = OFFSET.lock().unwrap_or_else(|e| e.into_inner());
+    let offset = match *cached {
+        Some((at, off)) if at.elapsed() < Duration::from_secs(60) => off,
+        _ => {
+            let off = with_env(|env, _| {
+                let zone = env.call_static_method("java/util/TimeZone", "getDefault", "()Ljava/util/TimeZone;", &[])?.l()?;
+                env.call_method(&zone, "getOffset", "(J)I", &[JValue::Long(now)])?.i()
+            })
+            .unwrap_or(0) as i64;
+            *cached = Some((Instant::now(), off));
+            off
+        }
+    };
+    (now + offset + ahead_ms).div_euclid(60_000).rem_euclid(24 * 60)
+}
+
 /// Whether the app may read the shared storage: every file (Android 11+
 /// "All files access"), or at least videos and music, which is all many
 /// Android TV firmwares let an app have.

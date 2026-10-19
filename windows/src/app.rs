@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{
@@ -15,6 +15,7 @@ use crate::crop::{self, Crop};
 use crate::hdr::{self, HdrInfo, Transfer};
 use crate::hdr_gl;
 use crate::playlist::{self, Playlist, Repeat};
+use crate::snapshot::{self, Image};
 use crate::store::Store;
 use crate::taskbar::{self, ThumbBar};
 use crate::theme::{self, Icon};
@@ -32,6 +33,15 @@ const HDR_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
 /// 203 nits came out brighter than other players; this matches PotPlayer.
 const HDR_WHITE_NITS: f32 = 290.0;
 const HDR_BRIGHTNESS: std::ops::RangeInclusive<i32> = 50..=150;
+/// How long to wait for the GPU to hand back an HDR frame being saved.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A frame to save once the HDR renderer has drawn it off screen.
+struct PendingCapture {
+    since: Instant,
+    dir: PathBuf,
+    name: String,
+}
 
 /// Flags set from libVLC's event thread and consumed on the UI thread.
 #[derive(Default)]
@@ -109,6 +119,12 @@ pub struct PlayerApp {
     wheel_acc: f32,
     icon: Option<TextureHandle>,
     thumb_bar: ThumbBar,
+
+    capture: Option<PendingCapture>,
+    /// Results of saving frames, from the background writer.
+    saved_tx: mpsc::Sender<Result<PathBuf, String>>,
+    saved_rx: mpsc::Receiver<Result<PathBuf, String>>,
+    last_saved: Option<PathBuf>,
 }
 
 impl PlayerApp {
@@ -140,6 +156,7 @@ impl PlayerApp {
             );
         }
 
+        let (saved_tx, saved_rx) = mpsc::channel();
         let mut app = Self {
             player,
             _instance: instance,
@@ -177,6 +194,10 @@ impl PlayerApp {
             wheel_acc: 0.0,
             icon,
             thumb_bar: ThumbBar::default(),
+            capture: None,
+            saved_tx,
+            saved_rx,
+            last_saved: None,
         };
         app.add_paths(files, true);
         Ok(app)
@@ -246,6 +267,100 @@ impl PlayerApp {
 
     fn is_active(&self) -> bool {
         self.playlist.current.is_some()
+    }
+
+    /// Saves the frame on screen (cropped as shown, at the video's own
+    /// resolution) as a PNG in Pictures/VPlayer.
+    fn save_frame(&mut self, ctx: &egui::Context) {
+        if !self.has_picture() {
+            self.notify("Нет кадра для сохранения");
+            return;
+        }
+        let dir = snapshot::folder();
+        let name = snapshot::file_name(&self.current_title().unwrap_or_default(), self.player.time());
+        if self.hdr_frame {
+            // Only the GPU has the converted picture; it reads it back while painting.
+            if let Some(r) = &self.hdr_gl {
+                r.lock().unwrap().capture = true;
+                self.capture = Some(PendingCapture { since: Instant::now(), dir, name });
+                ctx.request_repaint();
+            }
+            return;
+        }
+        let (w, h) = self.frame_size;
+        let uv = self.crop.uv_rect(w, h);
+        let image = self.sink.with_frame(|f| {
+            (f.width > 0 && f.format == PixelFormat::Rgba)
+                .then(|| Image { width: f.width, height: f.height, rgba: f.pixels.clone() })
+        });
+        match image {
+            Some(img) => self.write_frame(ctx, img.crop(uv), dir, name),
+            None => self.notify("Нет кадра для сохранения"),
+        }
+    }
+
+    fn write_frame(&self, ctx: &egui::Context, image: Image, dir: PathBuf, name: String) {
+        let tx = self.saved_tx.clone();
+        let ctx = ctx.clone();
+        // PNG encoding of a 4K frame takes a moment; keep the UI responsive.
+        std::thread::spawn(move || {
+            let result = std::fs::create_dir_all(&dir).map_err(|e| e.to_string()).and_then(|()| {
+                let path = snapshot::unique_path(&dir, &name);
+                image.save_png(&path).map(|()| path)
+            });
+            let _ = tx.send(result);
+            ctx.request_repaint();
+        });
+    }
+
+    fn poll_saved_frames(&mut self, ctx: &egui::Context) {
+        if let Some(pending) = &self.capture {
+            let got = self.hdr_gl.as_ref().and_then(|r| r.lock().unwrap().captured.take());
+            match got {
+                Some(Some(image)) => {
+                    let pending = self.capture.take().unwrap();
+                    self.write_frame(ctx, image, pending.dir, pending.name);
+                }
+                Some(None) => {
+                    self.capture = None;
+                    self.notify("Не удалось сохранить кадр");
+                }
+                None if pending.since.elapsed() >= CAPTURE_TIMEOUT => {
+                    self.capture = None;
+                    if let Some(r) = &self.hdr_gl {
+                        r.lock().unwrap().capture = false;
+                    }
+                    self.notify("Не удалось сохранить кадр");
+                }
+                None => ctx.request_repaint(),
+            }
+        }
+        while let Ok(result) = self.saved_rx.try_recv() {
+            match result {
+                Ok(path) => {
+                    // "Pictures\VPlayer": enough to find it, short enough for the OSD.
+                    let dir = path.parent().unwrap_or(&path);
+                    let folder = match (dir.parent().and_then(Path::file_name), dir.file_name()) {
+                        (Some(parent), Some(name)) => Path::new(parent).join(name),
+                        _ => dir.to_path_buf(),
+                    };
+                    self.notify(format!("Кадр сохранён в {}", folder.display()));
+                    self.last_saved = Some(path);
+                }
+                Err(e) => self.notify(format!("Не удалось сохранить кадр: {e}")),
+            }
+        }
+    }
+
+    fn open_frames_folder(&mut self) {
+        match &self.last_saved {
+            Some(path) if path.exists() => snapshot::reveal(path),
+            _ => {
+                let dir = snapshot::folder();
+                let _ = std::fs::create_dir_all(&dir);
+                snapshot::reveal(&dir);
+            }
+        }
     }
 
     fn has_picture(&self) -> bool {
@@ -511,6 +626,7 @@ impl PlayerApp {
                 None => self.texture = None,
             }
         }
+        self.poll_saved_frames(ctx);
         if self.hdr_wait.is_some_and(|t| t.elapsed() >= HDR_FRAME_TIMEOUT) && self.player.is_playing() {
             self.hdr_wait = None;
             if let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get(i)) {
@@ -607,6 +723,9 @@ impl PlayerApp {
         }
         if ctrl && pressed(Key::O) {
             self.open_files_dialog(true);
+        }
+        if ctrl && pressed(Key::E) {
+            self.save_frame(ctx);
         }
     }
 
@@ -1215,6 +1334,18 @@ impl PlayerApp {
             ui.menu_button("Аудиоустройство", |ui| self.audio_device_menu(ui));
             if self.hdr.is_some() {
                 ui.menu_button("HDR", |ui| self.hdr_menu(ui));
+            }
+            ui.separator();
+            if ui
+                .add_enabled(self.has_picture(), egui::Button::new("Сохранить кадр").shortcut_text("Ctrl+E"))
+                .clicked()
+            {
+                ui.close();
+                self.save_frame(ctx);
+            }
+            if ui.button("Папка с кадрами").clicked() {
+                ui.close();
+                self.open_frames_folder();
             }
             ui.separator();
             if ui.button("Открыть файлы…").clicked() {

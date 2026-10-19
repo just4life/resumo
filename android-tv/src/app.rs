@@ -101,6 +101,9 @@ pub struct PlayerApp {
     store: Store,
     /// Saved position to jump to once the new media starts playing.
     resume_at: Option<i64>,
+    /// The current video played to its end: where the stopped player says
+    /// it is must not be saved over that.
+    ended: bool,
     last_save: Instant,
     /// Unused fraction of mouse-wheel notches (touchpads scroll in pixels).
     wheel_acc: f32,
@@ -286,6 +289,7 @@ impl PlayerApp {
             status: None,
             store,
             resume_at: None,
+            ended: false,
             last_save: Instant::now(),
             wheel_acc: 0.0,
             icon,
@@ -343,6 +347,7 @@ impl PlayerApp {
         #[cfg(target_os = "android")]
         let title = item.title.clone();
         self.remember_position();
+        self.ended = false;
         self.player.stop();
         self.sink.clear();
         #[cfg(target_os = "android")]
@@ -462,6 +467,9 @@ impl PlayerApp {
 
     /// Saves where the current video is, so it can continue from there later.
     fn remember_position(&mut self) {
+        if self.ended {
+            return;
+        }
         let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get(i)) else { return };
         // Live streams have no length and cannot be resumed.
         if let (Some(len), true) = (self.player.length(), self.player.is_seekable()) {
@@ -796,8 +804,9 @@ impl PlayerApp {
             log::info!("libVLC: end reached");
             // Watched to the end: next time start from the beginning.
             if let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get(i)) {
-                self.store.forget(&item.location);
+                self.store.finish(&item.location);
             }
+            self.ended = true;
             self.next(true);
         }
         if self.last_save.elapsed() >= SAVE_EVERY {

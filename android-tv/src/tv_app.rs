@@ -375,6 +375,14 @@ impl PlayerApp {
         s.last = Instant::now();
     }
 
+    /// Jumps to `tenths` of the video (0 is the start), as YouTube's digits do.
+    fn tv_jump_to(&mut self, tenths: u8) {
+        let Some(len) = self.player.length().filter(|_| self.player.is_seekable()) else { return };
+        self.android.tv.seek = None;
+        self.player.set_time(len * i64::from(tenths.min(9)) / 10);
+        self.tv_show_bar();
+    }
+
     fn commit_seek(&mut self) {
         if let Some(s) = self.android.tv.seek.take() {
             self.player.set_time(s.target);
@@ -382,6 +390,10 @@ impl PlayerApp {
     }
 
     fn tv_player_press(&mut self, _ctx: &egui::Context, press: Press) {
+        if let Nav::Digit(tenths) = press.nav {
+            self.tv_jump_to(tenths);
+            return;
+        }
         if let Some(panel) = self.android.tv.panel {
             self.tv_panel_press(panel, press);
             return;
@@ -745,9 +757,8 @@ impl PlayerApp {
                 if r.bottom() > screen.bottom() - 40.0 {
                     break;
                 }
-                let at = self.store.position(&e.location).map(|ms| format!("с {}", format_time(ms)));
-                let trail = at.as_deref().map_or(Trail::None, Trail::Value);
-                tv::row(&p, r, Some((Icon::Play, theme::ACCENT)), &e.title, trail, tv.home_recent == Some(i), false);
+                let seen = self.store.seen(&e.location);
+                tv::seen_row(&p, r, Some((Icon::Play, theme::ACCENT)), &e.title, seen, tv.home_recent == Some(i));
             }
         }
         tv::hint(&p, screen, "OK — открыть     Назад — выйти");
@@ -835,24 +846,45 @@ impl PlayerApp {
         shade(Rect::from_min_max(screen.min, pos2(screen.right(), screen.top() + 110.0)), true, 190.0);
         let white = Color32::WHITE.gamma_multiply(alpha);
         let dim = theme::TEXT_DIM.gamma_multiply(alpha);
-        if let Some(t) = self.current_title() {
-            let mut job = egui::text::LayoutJob::simple(t, FontId::proportional(22.0), white, screen.width() - 80.0);
-            job.wrap.max_rows = 2;
-            let g = p.layout_job(job);
-            p.galley(screen.min + vec2(40.0, 26.0), g, white);
+        // Lighter than `dim`: it sits over the picture, not a dark panel.
+        let soft = Color32::from_gray(220).gamma_multiply(alpha);
+        let tv = &self.android.tv;
+        let length = self.player.length();
+        let shown_ms = tv.seek.as_ref().map_or_else(|| self.player.time(), |s| s.target);
+
+        // The clock, when the video ends, and where it is in the playlist.
+        let clock = |minutes: i64| format!("{:02}:{:02}", minutes / 60, minutes % 60);
+        let corner = screen.right_top() + vec2(-40.0, 22.0);
+        let now = p.text(corner, Align2::RIGHT_TOP, clock(platform::local_minutes(0)), FontId::proportional(28.0), white);
+        let mut info_left = now.left();
+        if let Some(len) = length.filter(|&l| l > 0) {
+            let left_ms = ((len - shown_ms).max(0) as f64 / self.rate.max(0.1) as f64) as i64;
+            let ends = format!("закончится в {}", clock(platform::local_minutes(left_ms)));
+            let r = p.text(pos2(corner.x, now.bottom() + 4.0), Align2::RIGHT_TOP, ends, FontId::proportional(17.0), soft);
+            info_left = info_left.min(r.left());
         }
         if let Some(i) = self.playlist.current {
             let n = self.playlist.items.len();
             if n > 1 {
-                p.text(screen.right_top() + vec2(-40.0, 30.0), Align2::RIGHT_TOP, format!("{} из {n}", i + 1), FontId::proportional(16.0), dim);
+                let at = pos2(info_left - 28.0, now.center().y);
+                let r = p.text(at, Align2::RIGHT_CENTER, format!("{} из {n}", i + 1), FontId::proportional(17.0), soft);
+                info_left = r.left();
             }
         }
+        // Again on the next minute, when nothing else redraws (paused).
+        let into_minute = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() % 60_000);
+        p.ctx().request_repaint_after(Duration::from_millis((60_000 - into_minute as u64) + 50));
 
-        let tv = &self.android.tv;
+        if let Some(t) = self.current_title() {
+            let width = (info_left - 40.0 - (screen.left() + 40.0)).max(200.0);
+            let mut job = egui::text::LayoutJob::simple(t, FontId::proportional(22.0), white, width);
+            job.wrap.max_rows = 2;
+            let g = p.layout_job(job);
+            p.galley(screen.min + vec2(40.0, 26.0), g, white);
+        }
+
         let playing = self.player.is_playing();
         // Seek bar.
-        let length = self.player.length();
-        let shown_ms = tv.seek.as_ref().map_or_else(|| self.player.time(), |s| s.target);
         let frac = match (tv.seek.as_ref(), length) {
             (Some(s), Some(l)) => s.target as f32 / l as f32,
             _ => self.player.position(),
@@ -1060,7 +1092,7 @@ impl PlayerApp {
         egui::Area::new(egui::Id::unique("file_browser")).order(egui::Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
             ui.set_min_size(rect.size());
             if let Some(b) = &mut self.android.browser {
-                b.show(ui, rect, has_access);
+                b.show(ui, rect, has_access, &self.store);
             }
         });
     }

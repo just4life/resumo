@@ -7,6 +7,7 @@ mod crop;
 mod hdr;
 mod hdr_gl;
 mod playlist;
+mod snapshot;
 mod store;
 mod taskbar;
 mod theme;

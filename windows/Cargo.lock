@@ -2368,6 +2368,7 @@ dependencies = [
  "eframe",
  "egui",
  "embed-resource",
+ "png",
  "raw-window-handle",
  "rfd",
 ]

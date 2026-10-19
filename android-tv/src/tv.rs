@@ -6,6 +6,8 @@
 use egui::{pos2, vec2, Align2, Color32, FontId, Key, Painter, Rect, Stroke};
 use winit::platform::android::activity::input::Keycode;
 
+use crate::app::format_time;
+use crate::store::Seen;
 use crate::theme::{self, Icon};
 
 /// One press of a remote-control button.
@@ -26,6 +28,8 @@ pub enum Nav {
     Prev,
     Rewind,
     Forward,
+    /// A digit button: in a video, jumps to that tenth of it, as on YouTube.
+    Digit(u8),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -76,6 +80,13 @@ pub fn take_presses(raw: &mut egui::RawInput, typing: bool, text_focused: bool) 
             Key::MediaStop => Nav::Stop,
             Key::MediaTrackNext => Nav::Next,
             Key::MediaTrackPrevious => Nav::Prev,
+            Key::Num0 | Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 | Key::Num7 | Key::Num8
+            | Key::Num9
+                if !typing =>
+            {
+                // `Key::Num0` .. `Key::Num9` are named "0" .. "9".
+                Nav::Digit(key.name().parse().unwrap_or(0))
+            }
             _ => return true,
         };
         if *pressed {
@@ -143,6 +154,8 @@ pub enum Trail<'a> {
     /// A value changed with ← and → (drawn with arrows while focused).
     Adjust(&'a str),
     Text(&'a str),
+    /// A video watched to the end.
+    Watched,
 }
 
 /// One row of a list: optional icon, a title (cut to one line) and `trail`.
@@ -155,6 +168,37 @@ pub fn row(p: &Painter, rect: Rect, icon: Option<(Icon, Color32)>, title: &str, 
         Color32::TRANSPARENT
     };
     p.rect_filled(rect, 10.0, fill);
+    row_content(p, rect, icon, title, trail, focused);
+}
+
+/// A video's row: like [`row`], with the part already seen shaded behind
+/// the title, and on the right where it was stopped, or "просмотрен".
+pub fn seen_row(p: &Painter, rect: Rect, icon: Option<(Icon, Color32)>, title: &str, seen: Option<Seen>, focused: bool) {
+    if focused {
+        p.rect_filled(rect, 10.0, theme::ACCENT);
+    }
+    let (share, at) = match seen {
+        None => (None, None),
+        Some(Seen::Started { at_ms, share }) => (share, Some(format!("с {}", format_time(at_ms)))),
+        Some(Seen::Finished { share }) => (Some(share.unwrap_or(1.0)), None),
+    };
+    if let Some(share) = share {
+        let mut part = rect;
+        part.set_width(rect.width() * share.clamp(0.0, 1.0));
+        let end = if share > 0.98 { 10 } else { 0 };
+        let radius = egui::CornerRadius { nw: 10, sw: 10, ne: end, se: end };
+        let fill = if focused { Color32::from_white_alpha(50) } else { theme::ACCENT.gamma_multiply(0.24) };
+        p.rect_filled(part, radius, fill);
+    }
+    let trail = match (seen, at.as_deref()) {
+        (Some(Seen::Finished { .. }), _) => Trail::Watched,
+        (_, Some(at)) => Trail::Value(at),
+        _ => Trail::None,
+    };
+    row_content(p, rect, icon, title, trail, focused);
+}
+
+fn row_content(p: &Painter, rect: Rect, icon: Option<(Icon, Color32)>, title: &str, trail: Trail, focused: bool) {
     let text_color = if focused { Color32::WHITE } else { theme::TEXT };
     let dim = if focused { Color32::from_white_alpha(210) } else { theme::TEXT_DIM };
     let mut left = rect.left() + 16.0;
@@ -193,6 +237,13 @@ pub fn row(p: &Painter, rect: Rect, icon: Option<(Icon, Color32)>, title: &str, 
         Trail::Adjust(v) => {
             let shown = if focused { format!("‹  {v}  ›") } else { v.to_owned() };
             let r = p.text(pos2(right, rect.center().y), Align2::RIGHT_CENTER, shown, FontId::proportional(16.0), text_color);
+            right = r.left() - 12.0;
+        }
+        Trail::Watched => {
+            let c = pos2(right - 9.0, rect.center().y);
+            let tick = vec![c + vec2(-6.0, 0.0), c + vec2(-2.0, 4.5), c + vec2(6.0, -5.0)];
+            p.add(egui::Shape::line(tick, Stroke::new(2.4, if focused { Color32::WHITE } else { theme::ACCENT })));
+            let r = p.text(pos2(right - 26.0, rect.center().y), Align2::RIGHT_CENTER, "просмотрен", FontId::proportional(15.0), dim);
             right = r.left() - 12.0;
         }
     }

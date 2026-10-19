@@ -9,6 +9,7 @@ use eframe::glow::{self, HasContext as _};
 use egui::{Rect, Ui};
 
 use crate::hdr::{HdrInfo, Transfer};
+use crate::snapshot::Image;
 use crate::video::{chroma_size, PixelFormat, VideoSink};
 
 const VERTEX: &str = r#"
@@ -125,6 +126,11 @@ pub struct Renderer {
     /// Size of the textures, so we know when to reallocate them.
     size: (usize, usize),
     serial: u64,
+    /// Set by the app: on the next paint, also render the frame at its own
+    /// resolution into `captured` (for saving it).
+    pub capture: bool,
+    /// `Some(None)` when the capture failed.
+    pub captured: Option<Option<Image>>,
 }
 
 /// Shared between the app and its paint callbacks.
@@ -198,6 +204,8 @@ impl Renderer {
                 program,
                 size: (0, 0),
                 serial: 0,
+                capture: false,
+                captured: None,
             };
             gl.use_program(Some(program));
             gl.uniform_1_i32(gl.get_uniform_location(program, "u_luma").as_ref(), 0);
@@ -250,6 +258,51 @@ impl Renderer {
         })
     }
 
+    /// Renders the `uv` part of the frame at its native size, off screen, and
+    /// reads it back. Leaves the screen framebuffer bound.
+    fn read_back(&self, gl: &glow::Context, uv: Rect, info: HdrInfo, white: f32) -> Option<Image> {
+        let w = ((uv.width() * self.size.0 as f32).round() as i32).max(1);
+        let h = ((uv.height() * self.size.1 as f32).round() as i32).max(1);
+        unsafe {
+            let tex = gl.create_texture().ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                w,
+                h,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+            let fbo = gl.create_framebuffer().ok();
+            let mut image = None;
+            if let Some(fbo) = fbo {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+                if gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE {
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.viewport(0, 0, w, h);
+                    self.draw(gl, uv, info, white);
+                    let (w, h) = (w as usize, h as usize);
+                    let mut rgba = vec![0u8; w * h * 4];
+                    gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+                    gl.read_pixels(0, 0, w as i32, h as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut rgba)));
+                    // GL rows go bottom to top.
+                    let row = w * 4;
+                    let flipped = rgba.chunks_exact(row).rev().flatten().copied().collect();
+                    image = Some(Image { width: w, height: h, rgba: flipped });
+                }
+                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                gl.delete_framebuffer(fbo);
+            }
+            gl.delete_texture(tex);
+            image
+        }
+    }
+
     fn draw(&self, gl: &glow::Context, uv: Rect, info: HdrInfo, white: f32) {
         unsafe {
             gl.disable(glow::BLEND);
@@ -281,6 +334,10 @@ pub fn paint(ui: &Ui, renderer: &Shared, sink: &Arc<VideoSink>, target: Rect, uv
         let mut r = renderer.lock().unwrap();
         if r.upload(gl, &sink) {
             r.draw(gl, uv, info, white);
+            if std::mem::take(&mut r.capture) {
+                // egui restores its own GL state after this callback.
+                r.captured = Some(r.read_back(gl, uv, info, white));
+            }
         }
     });
     ui.painter().add(egui::PaintCallback { rect: target, callback: Arc::new(callback) });

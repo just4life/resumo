@@ -11,6 +11,7 @@ use egui::{pos2, vec2, Align2, Color32, FontId, Rect, RichText, Ui};
 
 use crate::lan::{self, Lan, ListState, Listing, NetItem};
 use crate::playlist::{self, has_extension};
+use crate::store::Store;
 use crate::theme::{self, Icon};
 use crate::tv::{self, ListNav, Nav, Press, Trail};
 use crate::vlc::Instance;
@@ -559,8 +560,8 @@ impl Browser {
         Action::None
     }
 
-    /// Draws the browser over `rect`.
-    pub fn show(&mut self, ui: &mut Ui, rect: Rect, has_access: bool) {
+    /// Draws the browser over `rect`; `store` says which videos were seen.
+    pub fn show(&mut self, ui: &mut Ui, rect: Rect, has_access: bool, store: &Store) {
         if let Some(net) = &mut self.net {
             net.tick();
             ui.ctx().request_repaint_after(NET_REPOLL);
@@ -615,7 +616,7 @@ impl Browser {
         for (slot, i) in (self.list.top..end).enumerate() {
             let r = Rect::from_min_size(pos2(list.left(), list.top() + slot as f32 * step), vec2(list.width(), tv::ROW_H));
             let focused = self.zone == Zone::List && self.list.focus == i && self.editing.is_none();
-            self.paint_row(&p, r, rows[i], focused);
+            self.paint_row(&p, r, rows[i], focused, store);
         }
         tv::scroll_hints(&p, list, self.list.top > 0, end < rows.len());
         let below = list.top() + (end - self.list.top) as f32 * step + 14.0;
@@ -648,7 +649,7 @@ impl Browser {
         self.text_window(ui.ctx());
     }
 
-    fn paint_row(&self, p: &egui::Painter, r: Rect, row: Row, focused: bool) {
+    fn paint_row(&self, p: &egui::Painter, r: Rect, row: Row, focused: bool, store: &Store) {
         let folder = (Icon::Folder, theme::ACCENT);
         match row {
             Row::Access => {
@@ -668,7 +669,11 @@ impl Browser {
             Row::Entry(i) => {
                 let e = &self.entries[i];
                 let icon = if e.is_dir { folder } else { file_icon(&e.path) };
-                tv::row(p, r, Some(icon), &e.name, Trail::None, focused, false)
+                if e.is_dir {
+                    tv::row(p, r, Some(icon), &e.name, Trail::None, focused, false)
+                } else {
+                    tv::seen_row(p, r, Some(icon), &e.name, store.seen(&e.path.to_string_lossy()), focused)
+                }
             }
             Row::Address => tv::row(
                 p,
@@ -687,7 +692,12 @@ impl Browser {
                 let Some(net) = &self.net else { return };
                 let item = &net.items[i];
                 let icon = if item.is_dir { folder } else { file_icon(Path::new(&item.name)) };
-                tv::row(p, r, Some(icon), &item.name, Trail::None, focused, false)
+                if item.is_dir {
+                    tv::row(p, r, Some(icon), &item.name, Trail::None, focused, false)
+                } else {
+                    // The same location the playlist keeps (`Playlist::add_location`).
+                    tv::seen_row(p, r, Some(icon), &item.name, store.seen(item.mrl.trim()), focused)
+                }
             }
         }
     }
