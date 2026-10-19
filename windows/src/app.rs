@@ -52,6 +52,17 @@ struct Events {
     repaint: Mutex<Option<egui::Context>>,
 }
 
+impl Events {
+    /// Forgets what the media before reported. libVLC's stop waits for that
+    /// media's thread, so nothing of it arrives later: its end or error must
+    /// not move on from the next one.
+    fn reset(&self) {
+        self.end_reached.store(false, Ordering::SeqCst);
+        self.error.store(false, Ordering::SeqCst);
+        self.playing.store(false, Ordering::SeqCst);
+    }
+}
+
 unsafe extern "C" fn on_vlc_event(event: *const vlc::libvlc_event_t, data: *mut c_void) {
     let events = &*(data as *const Events);
     match (*event).type_ {
@@ -210,6 +221,7 @@ impl PlayerApp {
         let location = item.location.clone();
         self.remember_position();
         self.player.stop();
+        self.events.reset();
         self.sink.clear();
         // libVLC doesn't report the transfer function, so read it ourselves.
         self.hdr = if location.contains("://") { None } else { hdr::probe(Path::new(&location)) };
@@ -382,6 +394,7 @@ impl PlayerApp {
         self.remember_position();
         self.store.save();
         self.player.stop();
+        self.events.reset();
         self.sink.clear();
         self.playlist.current = None;
     }
@@ -1258,6 +1271,7 @@ impl PlayerApp {
                 self.selected = None;
                 if was_current {
                     self.player.stop();
+                    self.events.reset();
                     self.sink.clear();
                 }
             }
