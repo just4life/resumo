@@ -1,4 +1,4 @@
-//! VPlayer: a simple modern video player on top of libVLC.
+//! Resumo: a simple modern video player on top of libVLC.
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
@@ -20,8 +20,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("VPlayer")
-            .with_app_id("vplayer")
+            .with_title("Resumo")
+            .with_app_id("resumo")
             .with_inner_size([1180.0, 700.0])
             .with_min_inner_size([640.0, 380.0])
             .with_decorations(false)
@@ -31,7 +31,7 @@ fn main() -> eframe::Result {
     };
 
     eframe::run_native(
-        "VPlayer",
+        "Resumo",
         options,
         Box::new(move |cc| {
             let app = app::PlayerApp::new(cc, files)

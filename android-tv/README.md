@@ -1,4 +1,4 @@
-# VPlayer TV
+# Resumo TV
 
 Простой видеоплеер с современным тёмным интерфейсом. Написан на Rust, видео и звук
 воспроизводит libVLC (движок из исходников VLC 3.x).
@@ -34,7 +34,7 @@
 
 Эта папка — версия для телевизоров и приставок на Android TV / Google TV
 (Android 7+, ARM 32 и 64 бита). Всё управляется пультом: стрелки, OK, «Назад»,
-кнопки воспроизведения. Приложение называется **VPlayer TV**, появляется на
+кнопки воспроизведения. Приложение называется **Resumo TV**, появляется на
 главном экране телевизора (баннер) и ставится рядом с телефонной версией.
 
 - **Главный экран**: плитки «Файлы», «Сеть», «Ссылка» и «Плейлист» (если он не пуст),
@@ -131,11 +131,11 @@
 
 ## Готовые сборки
 
-- `dist/VPlayer-androidtv.apk` — для Android TV / Google TV 7 и новее (ARM 32 и 64 бита).
+- `dist/Resumo-androidtv.apk` — для Android TV / Google TV 7 и новее (ARM 32 и 64 бита).
   Как поставить: скопировать на флешку и открыть файловым менеджером телевизора,
   или передать через приложение вроде «Send files to TV» / Downloader, разрешив
   установку из этого источника.
-- `dist/VPlayer-androidtv-x86.apk` — та же версия для эмулятора Android TV.
+- `dist/Resumo-androidtv-x86.apk` — та же версия для эмулятора Android TV.
 
 Сборки для Windows, Linux и телефонов лежат в папках `player` и `player-android`.
 
@@ -148,7 +148,7 @@
 ```sh
 sudo apt install libvlc-dev vlc-plugin-base
 cargo build --release
-./target/release/vplayer video.mkv
+./target/release/resumo video.mkv
 ```
 
 **Windows (MSVC)**
@@ -157,7 +157,7 @@ cargo build --release
 2. Указать папку с `libvlc.lib`:
    `set VLC_LIB_DIR=C:\путь\к\build\x64` (для установленного VLC — его папка `sdk\lib`).
 3. `cargo build --release`
-4. Положить рядом с `vplayer.exe` файлы `libvlc.dll`, `libvlccore.dll` и папку `plugins`.
+4. Положить рядом с `resumo.exe` файлы `libvlc.dll`, `libvlccore.dll` и папку `plugins`.
 
 **Windows (кросс-сборка из Linux)**
 
@@ -167,8 +167,8 @@ rustup target add x86_64-pc-windows-gnu
 VLC_LIB_DIR=/путь/к/VideoLAN.LibVLC.Windows/build/x64 sh installer/build-windows.sh
 ```
 
-Скрипт собирает `vplayer.exe`, переносной zip и установщик
-(`installer/vplayer.nsi`, NSIS 3) в папку `dist/`.
+Скрипт собирает `resumo.exe`, переносной zip и установщик
+(`installer/resumo.nsi`, NSIS 3) в папку `dist/`.
 
 **Android TV**
 
@@ -182,11 +182,11 @@ ANDROID_HOME=/путь/к/sdk bash android/build-apk.sh
 ```
 
 Скрипт скачивает libVLC для Android (`org.videolan.android:libvlc-all` 3.7.7),
-собирает `android/` как `libvplayer.so` для arm64-v8a и armeabi-v7a, упаковывает
+собирает `android/` как `libresumo.so` для arm64-v8a и armeabi-v7a, упаковывает
 один APK вместе с Java-частью libVLC (`classes.jar` из пакета, переведённый `d8`
 в `classes.dex`; нужна для вывода видео на видеокарту), подписывает ключом
-`android/vplayer.keystore` и кладёт
-`dist/VPlayer-androidtv.apk`. `ABIS=x86` собирает версию для эмулятора Android TV
+`android/resumo.keystore` и кладёт
+`dist/Resumo-androidtv.apk`. `ABIS=x86` собирает версию для эмулятора Android TV
 (`system-images;android-30;android-tv;x86`).
 
 ## Устройство
@@ -212,8 +212,8 @@ ANDROID_HOME=/путь/к/sdk bash android/build-apk.sh
 | `installer/` | установщик для Windows и скрипт сборки |
 | `assets/` | иконка приложения (`icon.png`, `icon.ico`, ресурс для exe) |
 
-Позиции и настройки лежат в `%APPDATA%\VPlayer` (Windows),
-`~/Library/Application Support/VPlayer` (macOS), `~/.config/vplayer` (Linux)
+Позиции и настройки лежат в `%APPDATA%\Resumo` (Windows),
+`~/Library/Application Support/Resumo` (macOS), `~/.config/resumo` (Linux)
 или в личной папке приложения (Android).
 
 Весь код плеера на Rust, без C/C++ и без генерации привязок. libVLC — это

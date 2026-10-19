@@ -1,7 +1,7 @@
 //! Small on-disk memory: where each video was stopped, plus a few settings.
 //!
-//! Files live in the per-user config folder (`%APPDATA%\VPlayer`,
-//! `~/Library/Application Support/VPlayer`, `~/.config/vplayer`, or the app's
+//! Files live in the per-user config folder (`%APPDATA%\Resumo`,
+//! `~/Library/Application Support/Resumo`, `~/.config/resumo`, or the app's
 //! private folder on Android):
 //! `positions.tsv` holds `milliseconds<TAB>location` lines (`ms/length` once
 //! the length is known), newest last, `watched.txt` the locations watched to
@@ -43,13 +43,21 @@ pub fn config_dir() -> Option<PathBuf> {
     return ANDROID_DATA_DIR.get().cloned();
     #[allow(unreachable_code)]
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    if cfg!(windows) {
-        env("APPDATA").map(|d| d.join("VPlayer"))
+    let dir = if cfg!(windows) {
+        env("APPDATA").map(|d| d.join("Resumo"))
     } else if cfg!(target_os = "macos") {
-        env("HOME").map(|h| h.join("Library/Application Support/VPlayer"))
+        env("HOME").map(|h| h.join("Library/Application Support/Resumo"))
     } else {
-        env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config"))).map(|d| d.join("vplayer"))
+        env("XDG_CONFIG_HOME").or_else(|| env("HOME").map(|h| h.join(".config"))).map(|d| d.join("resumo"))
+    };
+    // The player used to be called VPlayer: carry its history and settings over.
+    if let Some(dir) = &dir {
+        let old = dir.with_file_name(if cfg!(any(windows, target_os = "macos")) { "VPlayer" } else { "vplayer" });
+        if !dir.exists() && old.is_dir() {
+            let _ = std::fs::rename(&old, dir);
+        }
     }
+    dir
 }
 
 #[derive(Default)]
@@ -228,7 +236,7 @@ mod tests {
 
     #[test]
     fn positions_round_trip_and_rules() {
-        let dir = std::env::temp_dir().join(format!("vplayer-store-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("resumo-store-{}", std::process::id()));
         let mut s = Store::load_from(Some(dir.clone()));
         s.set_position("/v/a.mkv", 60_000, Some(600_000));
         s.set_position("/v/b.mkv", 2_000, Some(600_000)); // too early: not stored
@@ -252,7 +260,7 @@ mod tests {
 
     #[test]
     fn watched_marks() {
-        let dir = std::env::temp_dir().join(format!("vplayer-watched-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("resumo-watched-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // A position saved by an older version, without the length.
         std::fs::write(dir.join("positions.tsv"), "70000\t/v/old.mkv\n").unwrap();

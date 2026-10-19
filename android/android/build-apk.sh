@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds VPlayer for Android (arm64-v8a) into ../dist/VPlayer-android-arm64.apk.
-# ABI=x86_64 builds ../dist/VPlayer-android-x86_64.apk instead (for an emulator).
+# Builds Resumo for Android (arm64-v8a) into ../dist/Resumo-android-arm64.apk.
+# ABI=x86_64 builds ../dist/Resumo-android-x86_64.apk instead (for an emulator).
 #
 # Needs: Rust with the aarch64-linux-android target, the Android SDK
 # (build-tools and a platform) and the NDK. Paths come from:
@@ -26,7 +26,7 @@ case "$ABI" in
 esac
 TRIPLE_ENV="$(echo "$triple" | tr 'a-z-' 'A-Z_')"
 work="${CARGO_TARGET_DIR:-$here/target}"
-out="$here/../dist/VPlayer-android-$suffix.apk"
+out="$here/../dist/Resumo-android-$suffix.apk"
 
 # --- libVLC for Android ------------------------------------------------------
 vlc_dir="$work/libvlc-$VLC_VERSION"
@@ -55,7 +55,7 @@ cargo build --release --target "$triple"
 stage="$work/apk"
 rm -rf "$stage"
 mkdir -p "$stage/lib/$ABI" "$stage/res"
-cp "$work/$triple/release/libvplayer.so" "$vlc_libs/libvlc.so" "$vlc_libs/libc++_shared.so" "$stage/lib/$ABI/"
+cp "$work/$triple/release/libresumo.so" "$vlc_libs/libvlc.so" "$vlc_libs/libc++_shared.so" "$stage/lib/$ABI/"
 
 # libVLC's Java part: only its AWindow is used, the surface libVLC draws the
 # hardware decoder's frames into (see src/surface.rs). The app's own code
@@ -73,13 +73,13 @@ cp "$vlc_dir/classes.dex" "$stage/"
 "$BUILD_TOOLS/zipalign" -f -p 4 "$stage/base.apk" "$stage/aligned.apk"
 
 # A fixed key, so a new APK installs over the previous one.
-keystore="$here/vplayer.keystore"
+keystore="$here/resumo.keystore"
 if [ ! -f "$keystore" ]; then
-    keytool -genkeypair -keystore "$keystore" -storepass vplayer -keypass vplayer -alias vplayer \
-        -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=VPlayer" >/dev/null
+    keytool -genkeypair -keystore "$keystore" -storepass resumo -keypass resumo -alias resumo \
+        -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Resumo" >/dev/null
 fi
 mkdir -p "$(dirname "$out")"
-"$BUILD_TOOLS/apksigner" sign --ks "$keystore" --ks-pass pass:vplayer --key-pass pass:vplayer \
-    --ks-key-alias vplayer --v4-signing-enabled false --out "$out" "$stage/aligned.apk"
+"$BUILD_TOOLS/apksigner" sign --ks "$keystore" --ks-pass pass:resumo --key-pass pass:resumo \
+    --ks-key-alias resumo --v4-signing-enabled false --out "$out" "$stage/aligned.apk"
 "$BUILD_TOOLS/apksigner" verify "$out"
 echo "Built $out"

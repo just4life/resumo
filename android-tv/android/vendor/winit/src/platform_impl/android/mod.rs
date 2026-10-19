@@ -32,7 +32,7 @@ pub(crate) static SHOW_KEYBOARD: std::sync::OnceLock<fn(bool)> = std::sync::Once
 
 /// Remote-control and gamepad keys that winit has no `Key` for (or that
 /// egui drops): kept here for the app to read with
-/// `winit::platform::android::take_remote_keys`. VPlayer TV addition.
+/// `winit::platform::android::take_remote_keys`. Resumo TV addition.
 pub(crate) static REMOTE_KEYS: Mutex<Vec<(Keycode, bool)>> = Mutex::new(Vec::new());
 
 fn is_remote_only_key(keycode: Keycode) -> bool {
@@ -306,7 +306,7 @@ impl<T: 'static> EventLoop<T> {
                     warn!("TODO: forward saveState notification to application");
                 },
                 MainEvent::Pause => {
-                    // VPlayer: a paused activity can still be on screen (picture-in-picture,
+                    // Resumo: a paused activity can still be on screen (picture-in-picture,
                     // split screen), so keep drawing until it is stopped.
                     debug!("App Paused - still running until stopped");
                 },

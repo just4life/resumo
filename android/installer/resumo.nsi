@@ -1,15 +1,15 @@
-; VPlayer installer for Windows (NSIS 3, Unicode).
+; Resumo installer for Windows (NSIS 3, Unicode).
 ;
-; Build:  makensis -DSRC=<folder with vplayer.exe, libvlc*.dll, plugins> \
-;                  -DVERSION=0.1.0 -DOUTFILE=VPlayer-Setup.exe installer/vplayer.nsi
+; Build:  makensis -DSRC=<folder with resumo.exe, libvlc*.dll, plugins> \
+;                  -DVERSION=0.1.0 -DOUTFILE=Resumo-Setup.exe installer/resumo.nsi
 ;
 ; Installs per machine into Program Files, adds Start menu / desktop shortcuts,
-; an uninstaller, and registers VPlayer for video and audio files: ProgIDs,
+; an uninstaller, and registers Resumo for video and audio files: ProgIDs,
 ; "Open with", and Default Apps capabilities. Windows 10/11 do not let a
 ; program make itself the default silently, so the finish page opens the
-; Default Apps settings for VPlayer, where one click confirms it.
+; Default Apps settings for Resumo, where one click confirms it.
 
-; 64-bit installer: VPlayer itself is x64-only.
+; 64-bit installer: Resumo itself is x64-only.
 Target amd64-unicode
 SetCompressor /SOLID lzma
 
@@ -17,19 +17,19 @@ SetCompressor /SOLID lzma
   !define VERSION "0.1.0"
 !endif
 !ifndef SRC
-  !error "Pass -DSRC=<folder with vplayer.exe and libVLC>"
+  !error "Pass -DSRC=<folder with resumo.exe and libVLC>"
 !endif
 !ifndef OUTFILE
-  !define OUTFILE "VPlayer-Setup.exe"
+  !define OUTFILE "Resumo-Setup.exe"
 !endif
 
-!define APP        "VPlayer"
-!define EXE        "vplayer.exe"
-!define PUBLISHER  "VPlayer"
+!define APP        "Resumo"
+!define EXE        "resumo.exe"
+!define PUBLISHER  "Resumo"
 !define REGKEY     "Software\${APP}"
 !define UNINSTKEY  "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP}"
-!define PROG_VIDEO "VPlayer.Video"
-!define PROG_AUDIO "VPlayer.Audio"
+!define PROG_VIDEO "Resumo.Video"
+!define PROG_AUDIO "Resumo.Audio"
 
 Name "${APP}"
 OutFile "${OUTFILE}"
@@ -55,7 +55,7 @@ VIAddVersionKey "LegalCopyright" "GPL-2.0-or-later"
 !define MUI_COMPONENTSPAGE_SMALLDESC
 
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${EXE}"
-!define MUI_FINISHPAGE_RUN_TEXT "Запустить VPlayer"
+!define MUI_FINISHPAGE_RUN_TEXT "Запустить Resumo"
 ; The "readme" checkbox is reused to open the Default Apps settings.
 !define MUI_FINISHPAGE_SHOWREADME
 !define MUI_FINISHPAGE_SHOWREADME_TEXT "Открыть настройки «Приложения по умолчанию»"
@@ -84,7 +84,7 @@ VIAddVersionKey "LegalCopyright" "GPL-2.0-or-later"
   ${If} ${MAKE_DEFAULT} == 1
     ReadRegStr $0 HKLM "Software\Classes\.${EXT}" ""
     ${If} $0 != "${PROGID}"
-      WriteRegStr HKLM "Software\Classes\.${EXT}" "VPlayer.Backup" "$0"
+      WriteRegStr HKLM "Software\Classes\.${EXT}" "Resumo.Backup" "$0"
       WriteRegStr HKLM "Software\Classes\.${EXT}" "" "${PROGID}"
     ${EndIf}
   ${EndIf}
@@ -95,10 +95,10 @@ VIAddVersionKey "LegalCopyright" "GPL-2.0-or-later"
   DeleteRegKey /ifempty HKLM "Software\Classes\.${EXT}\OpenWithProgids"
   ReadRegStr $0 HKLM "Software\Classes\.${EXT}" ""
   ${If} $0 == "${PROGID}"
-    ReadRegStr $1 HKLM "Software\Classes\.${EXT}" "VPlayer.Backup"
+    ReadRegStr $1 HKLM "Software\Classes\.${EXT}" "Resumo.Backup"
     WriteRegStr HKLM "Software\Classes\.${EXT}" "" "$1"
   ${EndIf}
-  DeleteRegValue HKLM "Software\Classes\.${EXT}" "VPlayer.Backup"
+  DeleteRegValue HKLM "Software\Classes\.${EXT}" "Resumo.Backup"
 !macroend
 
 !macro VideoTypes MACRO ARG1 ARG2
@@ -146,14 +146,14 @@ VIAddVersionKey "LegalCopyright" "GPL-2.0-or-later"
 !macroend
 
 Function OpenDefaultApps
-  ; Windows 11 opens VPlayer's own page with a "Set default" button;
+  ; Windows 11 opens Resumo's own page with a "Set default" button;
   ; Windows 10 ignores the parameter and shows the general Default Apps page.
   ExecShell "open" "ms-settings:defaultapps?registeredAppMachine=${APP}"
 FunctionEnd
 
 Function .onInit
   ${IfNot} ${RunningX64}
-    MessageBox MB_ICONSTOP "VPlayer работает только в 64-битной Windows."
+    MessageBox MB_ICONSTOP "Resumo работает только в 64-битной Windows."
     Abort
   ${EndIf}
   SetRegView 64
@@ -167,7 +167,7 @@ FunctionEnd
 
 ; ---------------------------------------------------------------- sections
 
-Section "VPlayer" SecMain
+Section "Resumo" SecMain
   SectionIn RO
   SetOutPath "$INSTDIR"
   ; Drop plugins from an older version so stale ones do not load.
@@ -180,7 +180,7 @@ Section "VPlayer" SecMain
 
   CreateShortcut "$SMPROGRAMS\${APP}.lnk" "$INSTDIR\${EXE}"
 
-  ; App registration: "Open with" list, App Paths (Win+R "vplayer"),
+  ; App registration: "Open with" list, App Paths (Win+R "resumo"),
   ; and the Default Apps capabilities.
   !insertmacro ProgId ${PROG_VIDEO} "Видеофайл"
   !insertmacro ProgId ${PROG_AUDIO} "Аудиофайл"
@@ -195,7 +195,7 @@ Section "VPlayer" SecMain
   WriteRegStr HKLM "Software\RegisteredApplications" "${APP}" "${REGKEY}\Capabilities"
 
   ; Every type is offered in "Open with" and Default Apps; the sections
-  ; below decide which ones VPlayer also claims as the default.
+  ; below decide which ones Resumo also claims as the default.
   !insertmacro VideoTypes Assoc ${PROG_VIDEO} 0
   !insertmacro AudioTypes Assoc ${PROG_AUDIO} 0
 
@@ -229,9 +229,9 @@ SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} "Сам плеер и движок VLC."
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} "Значок VPlayer на рабочем столе."
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecVideo} "Открывать mp4, mkv, avi и другие видеофайлы в VPlayer."
-  !insertmacro MUI_DESCRIPTION_TEXT ${SecAudio} "Открывать mp3, flac, wav и другие аудиофайлы в VPlayer."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} "Значок Resumo на рабочем столе."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecVideo} "Открывать mp4, mkv, avi и другие видеофайлы в Resumo."
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecAudio} "Открывать mp3, flac, wav и другие аудиофайлы в Resumo."
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
 ; ---------------------------------------------------------------- uninstall

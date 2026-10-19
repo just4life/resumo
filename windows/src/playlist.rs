@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn m3u_round_trip() {
-        let dir = std::env::temp_dir().join(format!("vplayer-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("resumo-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.m3u");
         let mut p = list(2);
