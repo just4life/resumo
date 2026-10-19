@@ -45,9 +45,9 @@ impl Image {
     }
 }
 
-/// `<Pictures>/VPlayer`, where saved frames go.
+/// `<Pictures>/Resumo`, where saved frames go.
 pub fn folder() -> PathBuf {
-    pictures_dir().join("VPlayer")
+    pictures_dir().join("Resumo")
 }
 
 /// "Movie 01-23-45.png" for a frame of "Movie" at 1:23:45, safe on every OS.
@@ -60,7 +60,7 @@ pub fn file_name(title: &str, ms: i64) -> String {
     // Windows drops trailing dots and spaces from names.
     name.truncate(name.trim_end_matches(['.', ' ']).len());
     if name.is_empty() {
-        name.push_str("VPlayer");
+        name.push_str("Resumo");
     }
     let s = ms.max(0) / 1000;
     format!("{name} {:02}-{:02}-{:02}.png", s / 3600, s / 60 % 60, s % 60)
@@ -164,9 +164,9 @@ mod tests {
     fn names_are_safe_and_unique() {
         assert_eq!(file_name("Kung Fu: Soccer?", 3_723_000), "Kung Fu_ Soccer_ 01-02-03.png");
         assert_eq!(file_name("dots...", 5_000), "dots 00-00-05.png");
-        assert_eq!(file_name("", 0), "VPlayer 00-00-00.png");
+        assert_eq!(file_name("", 0), "Resumo 00-00-00.png");
 
-        let dir = std::env::temp_dir().join(format!("vplayer-snap-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("resumo-snap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let first = unique_path(&dir, "a.png");
         assert_eq!(first, dir.join("a.png"));

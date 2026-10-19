@@ -5,11 +5,11 @@
 
 fn main() {
     println!("cargo:rerun-if-env-changed=VLC_LIB_DIR");
-    println!("cargo:rerun-if-changed=assets/vplayer.rc");
+    println!("cargo:rerun-if-changed=assets/resumo.rc");
     println!("cargo:rerun-if-changed=assets/icon.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        // Gives vplayer.exe its icon in Explorer and the taskbar.
-        if let Err(e) = embed_resource::compile("assets/vplayer.rc", embed_resource::NONE).manifest_optional() {
+        // Gives resumo.exe its icon in Explorer and the taskbar.
+        if let Err(e) = embed_resource::compile("assets/resumo.rc", embed_resource::NONE).manifest_optional() {
             println!("cargo:warning=could not embed the Windows icon: {e}");
         }
     }

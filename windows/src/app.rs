@@ -282,7 +282,7 @@ impl PlayerApp {
     }
 
     /// Saves the frame on screen (cropped as shown, at the video's own
-    /// resolution) as a PNG in Pictures/VPlayer.
+    /// resolution) as a PNG in Pictures/Resumo.
     fn save_frame(&mut self, ctx: &egui::Context) {
         if !self.has_picture() {
             self.notify("Нет кадра для сохранения");
@@ -350,7 +350,7 @@ impl PlayerApp {
         while let Ok(result) = self.saved_rx.try_recv() {
             match result {
                 Ok(path) => {
-                    // "Pictures\VPlayer": enough to find it, short enough for the OSD.
+                    // "Pictures\Resumo": enough to find it, short enough for the OSD.
                     let dir = path.parent().unwrap_or(&path);
                     let folder = match (dir.parent().and_then(Path::file_name), dir.file_name()) {
                         (Some(parent), Some(name)) => Path::new(parent).join(name),
@@ -653,8 +653,8 @@ impl PlayerApp {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         let title = match self.current_title() {
-            Some(t) => format!("{t} — VPlayer"),
-            None => "VPlayer".to_owned(),
+            Some(t) => format!("{t} — Resumo"),
+            None => "Resumo".to_owned(),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
@@ -766,7 +766,7 @@ impl PlayerApp {
             let (logo, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
             self.paint_app_icon(ui.painter(), logo);
             ui.add_space(2.0);
-            ui.label(RichText::new("VPlayer").size(12.5).color(theme::TEXT));
+            ui.label(RichText::new("Resumo").size(12.5).color(theme::TEXT));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="org.vplayer.app"
+    package="org.resumo.app"
     android:versionCode="4"
     android:versionName="0.1.0">
 
@@ -23,7 +23,7 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
-        android:label="VPlayer"
+        android:label="Resumo"
         android:icon="@mipmap/ic_launcher"
         android:hasCode="true"
         android:extractNativeLibs="true"
@@ -39,14 +39,14 @@
             android:resizeableActivity="true"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density">
 
-            <meta-data android:name="android.app.lib_name" android:value="vplayer" />
+            <meta-data android:name="android.app.lib_name" android:value="resumo" />
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- "Open with VPlayer" for video and audio files. -->
+            <!-- "Open with Resumo" for video and audio files. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />

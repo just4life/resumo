@@ -170,7 +170,7 @@ impl<T> EventLoopBuilderExtAndroid for EventLoopBuilder<T> {
 /// Key presses from a TV remote or gamepad that do not reach the app as
 /// regular keyboard input (play, pause, rewind, fast forward, menu, gamepad
 /// buttons...), oldest first, with whether each one is a repeat.
-/// VPlayer TV addition.
+/// Resumo TV addition.
 #[cfg(android_platform)]
 pub fn take_remote_keys() -> Vec<(activity::input::Keycode, bool)> {
     std::mem::take(&mut *crate::platform_impl::REMOTE_KEYS.lock().unwrap())
@@ -178,7 +178,7 @@ pub fn take_remote_keys() -> Vec<(activity::input::Keycode, bool)> {
 
 /// Replaces how the on-screen keyboard is opened (`true`) and closed
 /// (`false`) for text fields: the NativeActivity glue's own request to open
-/// it is ignored on Android 11+. VPlayer TV addition.
+/// it is ignored on Android 11+. Resumo TV addition.
 #[cfg(android_platform)]
 pub fn set_show_keyboard(f: fn(bool)) {
     let _ = crate::platform_impl::SHOW_KEYBOARD.set(f);

@@ -279,7 +279,7 @@ impl<T: 'static> EventLoop<T> {
                     warn!("TODO: forward saveState notification to application");
                 },
                 MainEvent::Pause => {
-                    // VPlayer: a paused activity can still be on screen (picture-in-picture,
+                    // Resumo: a paused activity can still be on screen (picture-in-picture,
                     // split screen), so keep drawing until it is stopped.
                     debug!("App Paused - still running until stopped");
                 },

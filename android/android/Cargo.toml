@@ -1,13 +1,13 @@
 [package]
-name = "vplayer-android"
+name = "resumo-android"
 version = "0.1.0"
 edition = "2021"
-description = "VPlayer for Android: the desktop player's code built as a NativeActivity library"
+description = "Resumo for Android: the desktop player's code built as a NativeActivity library"
 license = "GPL-2.0-or-later"
 build = "build.rs"
 
 [lib]
-name = "vplayer"
+name = "resumo"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 

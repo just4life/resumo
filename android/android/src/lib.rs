@@ -1,4 +1,4 @@
-//! VPlayer for Android. The player itself is the desktop code in `../src`;
+//! Resumo for Android. The player itself is the desktop code in `../src`;
 //! this crate builds it as the native library of a NativeActivity and adds
 //! the Android glue in `platform.rs` and the hardware video output in
 //! `surface.rs`.
@@ -38,7 +38,7 @@ pub const ICON_PNG: &[u8] = include_bytes!("../../assets/icon.png");
 
 #[no_mangle]
 fn android_main(app: AndroidApp) {
-    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("VPlayer"));
+    android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("Resumo"));
     std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
     platform::init(&app);
 
@@ -49,7 +49,7 @@ fn android_main(app: AndroidApp) {
         ..Default::default()
     };
     let result = eframe::run_native(
-        "VPlayer",
+        "Resumo",
         options,
         Box::new(|cc| {
             let app = app::PlayerApp::new(cc, Vec::new())
@@ -58,6 +58,6 @@ fn android_main(app: AndroidApp) {
         }),
     );
     if let Err(e) = result {
-        log::error!("VPlayer stopped: {e}");
+        log::error!("Resumo stopped: {e}");
     }
 }

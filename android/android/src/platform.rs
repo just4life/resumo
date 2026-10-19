@@ -246,7 +246,7 @@ pub fn set_keep_screen_on(on: bool) {
             let pm = env
                 .call_method(activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[JValue::Object(&name)])?
                 .l()?;
-            let tag = env.new_string("vplayer:playback")?;
+            let tag = env.new_string("resumo:playback")?;
             let lock = env
                 .call_method(
                     &pm,
@@ -399,7 +399,7 @@ pub fn set_multicast(on: bool) {
             let wm = env
                 .call_method(&ctx, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[JValue::Object(&name)])?
                 .l()?;
-            let tag = env.new_string("vplayer:discovery")?;
+            let tag = env.new_string("resumo:discovery")?;
             let lock = env
                 .call_method(
                     &wm,
@@ -460,7 +460,7 @@ fn pip_params<'a>(
 }
 
 /// Broadcast sent by the pause/play button on the small window.
-const PIP_ACTION: &str = "org.vplayer.app.PIP_PLAY_PAUSE";
+const PIP_ACTION: &str = "org.resumo.app.PIP_PLAY_PAUSE";
 
 /// What receives [`PIP_ACTION`], and the intent the button sends.
 struct PipButton {
@@ -542,7 +542,7 @@ pub fn pip_button_pressed() -> bool {
         if extras.is_null() {
             return Ok(false);
         }
-        let key = env.new_string("vplayer.seen")?;
+        let key = env.new_string("resumo.seen")?;
         let seen = env.call_method(&extras, "containsKey", "(Ljava/lang/String;)Z", &[JValue::Object(&key)])?.z()?;
         if !seen {
             env.call_method(&extras, "putBoolean", "(Ljava/lang/String;Z)V", &[JValue::Object(&key), JValue::Bool(1)])?;
@@ -627,7 +627,7 @@ pub fn clipboard_text() -> Option<String> {
     .flatten()
 }
 
-/// What the app was opened with ("Open with VPlayer" in a file manager or a
+/// What the app was opened with ("Open with Resumo" in a file manager or a
 /// browser): a local path when the file is reachable by path, otherwise an
 /// `fd://` or network location libVLC can play directly.
 pub fn intent_location() -> Option<String> {

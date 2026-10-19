@@ -719,7 +719,7 @@ impl PlayerApp {
         p.rect_filled(screen, 0.0, theme::BG);
         let logo = Rect::from_min_size(screen.min + vec2(40.0, 28.0), vec2(34.0, 34.0));
         self.paint_app_icon(&p, logo);
-        p.text(logo.right_center() + vec2(12.0, 0.0), Align2::LEFT_CENTER, "VPlayer", FontId::proportional(26.0), theme::TEXT);
+        p.text(logo.right_center() + vec2(12.0, 0.0), Align2::LEFT_CENTER, "Resumo", FontId::proportional(26.0), theme::TEXT);
 
         let tiles = self.home_tiles();
         let tv = &self.android.tv;

@@ -346,7 +346,7 @@ impl Browser {
                     ui.set_width(ui.available_width());
                     ui.label(RichText::new("Нет доступа к файлам").strong().color(theme::TEXT));
                     ui.label(
-                        RichText::new("Чтобы видеть видео и субтитры в папках, разрешите VPlayer доступ ко всем файлам.")
+                        RichText::new("Чтобы видеть видео и субтитры в папках, разрешите Resumo доступ ко всем файлам.")
                             .color(theme::TEXT_DIM),
                     );
                     ui.add_space(4.0);

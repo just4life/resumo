@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds VPlayer TV for Android TV into ../dist/VPlayer-androidtv.apk, with
+# Builds Resumo TV for Android TV into ../dist/Resumo-androidtv.apk, with
 # libraries for both 64-bit and 32-bit ARM (many TVs and TV boxes run a
 # 32-bit system even on a 64-bit chip). ABIS="x86" builds
-# ../dist/VPlayer-androidtv-x86.apk instead, for the Android TV emulator.
+# ../dist/Resumo-androidtv-x86.apk instead, for the Android TV emulator.
 #
 # Needs: Rust with the aarch64-linux-android and armv7-linux-androideabi
 # targets, the Android SDK (build-tools and a platform) and the NDK. Paths come from:
@@ -23,9 +23,9 @@ API=24
 ABIS="${ABIS:-arm64-v8a armeabi-v7a}"
 work="${CARGO_TARGET_DIR:-$here/target}"
 if [ "$ABIS" = "arm64-v8a armeabi-v7a" ]; then
-    out="$here/../dist/VPlayer-androidtv.apk"
+    out="$here/../dist/Resumo-androidtv.apk"
 else
-    out="$here/../dist/VPlayer-androidtv-${ABIS// /-}.apk"
+    out="$here/../dist/Resumo-androidtv-${ABIS// /-}.apk"
 fi
 
 # --- libVLC for Android ------------------------------------------------------
@@ -65,7 +65,7 @@ for abi in $ABIS; do
         "VLC_LIB_DIR=$vlc_libs" \
         cargo build --release --target "$triple"
     mkdir -p "$stage/lib/$abi"
-    cp "$work/$triple/release/libvplayer.so" "$vlc_libs/libvlc.so" "$vlc_libs/libc++_shared.so" "$stage/lib/$abi/"
+    cp "$work/$triple/release/libresumo.so" "$vlc_libs/libvlc.so" "$vlc_libs/libc++_shared.so" "$stage/lib/$abi/"
 done
 
 # --- libVLC's Java part ---------------------------------------------------------
@@ -84,13 +84,13 @@ cp "$vlc_dir/classes.dex" "$stage/"
 "$BUILD_TOOLS/zipalign" -f -p 4 "$stage/base.apk" "$stage/aligned.apk"
 
 # A fixed key, so a new APK installs over the previous one.
-keystore="$here/vplayer.keystore"
+keystore="$here/resumo.keystore"
 if [ ! -f "$keystore" ]; then
-    keytool -genkeypair -keystore "$keystore" -storepass vplayer -keypass vplayer -alias vplayer \
-        -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=VPlayer" >/dev/null
+    keytool -genkeypair -keystore "$keystore" -storepass resumo -keypass resumo -alias resumo \
+        -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Resumo" >/dev/null
 fi
 mkdir -p "$(dirname "$out")"
-"$BUILD_TOOLS/apksigner" sign --ks "$keystore" --ks-pass pass:vplayer --key-pass pass:vplayer \
-    --ks-key-alias vplayer --v4-signing-enabled false --out "$out" "$stage/aligned.apk"
+"$BUILD_TOOLS/apksigner" sign --ks "$keystore" --ks-pass pass:resumo --key-pass pass:resumo \
+    --ks-key-alias resumo --v4-signing-enabled false --out "$out" "$stage/aligned.apk"
 "$BUILD_TOOLS/apksigner" verify "$out"
 echo "Built $out"

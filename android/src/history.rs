@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn keeps_newest_five() {
-        let dir = std::env::temp_dir().join(format!("vplayer-history-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("resumo-history-{}", std::process::id()));
         let mut h = History::load_from(Some(dir.clone()));
         for i in 0..7 {
             h.add(&format!("smb://nas/Видео/{i}.mkv"), &format!("Фильм {i}"));
@@ -110,7 +110,7 @@ mod tests {
 
     #[test]
     fn one_entry_per_file() {
-        let dir = std::env::temp_dir().join(format!("vplayer-history-links-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("resumo-history-links-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.mkv");
         std::fs::write(&file, b"").unwrap();

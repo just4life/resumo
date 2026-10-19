@@ -1,4 +1,4 @@
-# VPlayer
+# Resumo
 
 Простой видеоплеер с современным тёмным интерфейсом. Написан на Rust, видео и звук
 воспроизводит libVLC (движок из исходников VLC 3.x).
@@ -49,7 +49,7 @@
   для этого компьютера (файл `network-logins.tsv` в личной папке приложения,
   недоступной другим приложениям). Найденное открывается как обычные
   файлы.
-- **«Открыть с помощью» → VPlayer** в файловом менеджере запускает файл в плеере
+- **«Открыть с помощью» → Resumo** в файловом менеджере запускает файл в плеере
   (если плеер уже открыт, файл нужно открыть через его браузер).
 - **Жесты на видео**: касание в центре ставит на паузу и снимает с неё,
   в остальных местах показывает и прячет панель; двойное касание слева
@@ -125,19 +125,19 @@
 
 ## Готовые сборки
 
-- `dist/VPlayer-Setup-0.1.0.zip` (внутри `VPlayer-Setup-0.1.0.exe`) — установщик для Windows 10/11 (64-бит).
-  Ставит плеер в `Program Files\VPlayer`, создаёт ярлыки и регистрирует VPlayer
+- `dist/Resumo-Setup-0.1.0.zip` (внутри `Resumo-Setup-0.1.0.exe`) — установщик для Windows 10/11 (64-бит).
+  Ставит плеер в `Program Files\Resumo`, создаёт ярлыки и регистрирует Resumo
   для видео (mkv, mp4, avi, mov, webm, ts и др.), по желанию и для музыки.
   Windows 10/11 не позволяют программам молча назначать себя плеером по умолчанию,
   поэтому в конце установщик открывает «Приложения по умолчанию»: там нужно
-  выбрать VPlayer. Удаляется через «Установленные приложения» и возвращает
-  прежние ассоциации. Тихая установка: `VPlayer-Setup-0.1.0.exe /S`.
-- `dist/VPlayer-windows-x64.zip` — переносная версия без установки: распаковать
-  и запустить `VPlayer\vplayer.exe`. libVLC и плагины уже лежат рядом, VLC ставить не нужно.
-- `dist/VPlayer-android-arm64.apk` — для Android 7 и новее (64-битные ARM,
+  выбрать Resumo. Удаляется через «Установленные приложения» и возвращает
+  прежние ассоциации. Тихая установка: `Resumo-Setup-0.1.0.exe /S`.
+- `dist/Resumo-windows-x64.zip` — переносная версия без установки: распаковать
+  и запустить `Resumo\resumo.exe`. libVLC и плагины уже лежат рядом, VLC ставить не нужно.
+- `dist/Resumo-android-arm64.apk` — для Android 7 и новее (64-битные ARM,
   то есть почти все телефоны с 2017 года). Скопировать на телефон и открыть,
   разрешив установку из этого источника.
-- `dist/vplayer-linux-x64` — для Linux, нужен установленный VLC
+- `dist/resumo-linux-x64` — для Linux, нужен установленный VLC
   (`sudo apt install vlc` или `libvlc5 vlc-plugin-base`).
 
 ## Сборка из исходников
@@ -149,7 +149,7 @@
 ```sh
 sudo apt install libvlc-dev vlc-plugin-base
 cargo build --release
-./target/release/vplayer video.mkv
+./target/release/resumo video.mkv
 ```
 
 **Windows (MSVC)**
@@ -158,7 +158,7 @@ cargo build --release
 2. Указать папку с `libvlc.lib`:
    `set VLC_LIB_DIR=C:\путь\к\build\x64` (для установленного VLC — его папка `sdk\lib`).
 3. `cargo build --release`
-4. Положить рядом с `vplayer.exe` файлы `libvlc.dll`, `libvlccore.dll` и папку `plugins`.
+4. Положить рядом с `resumo.exe` файлы `libvlc.dll`, `libvlccore.dll` и папку `plugins`.
 
 **Windows (кросс-сборка из Linux)**
 
@@ -168,8 +168,8 @@ rustup target add x86_64-pc-windows-gnu
 VLC_LIB_DIR=/путь/к/VideoLAN.LibVLC.Windows/build/x64 sh installer/build-windows.sh
 ```
 
-Скрипт собирает `vplayer.exe`, переносной zip и установщик
-(`installer/vplayer.nsi`, NSIS 3) в папку `dist/`.
+Скрипт собирает `resumo.exe`, переносной zip и установщик
+(`installer/resumo.nsi`, NSIS 3) в папку `dist/`.
 
 **Android**
 
@@ -184,9 +184,9 @@ ANDROID_HOME=/путь/к/sdk bash android/build-apk.sh
 
 Скрипт скачивает libVLC для Android (`org.videolan.android:libvlc-all` 3.7.7
 с Maven Central, или берёт готовый `.aar` из `VLC_AAR`), собирает `android/`
-как `libvplayer.so` для NativeActivity, упаковывает APK с `libvlc.so`,
+как `libresumo.so` для NativeActivity, упаковывает APK с `libvlc.so`,
 `libc++_shared.so` и Java-частью libVLC (`classes.dex`, её собирает `d8`
-из build-tools), подписывает ключом `android/vplayer.keystore`
+из build-tools), подписывает ключом `android/resumo.keystore`
 (его надо сохранить: APK с другим ключом не установится поверх старого)
 и кладёт результат в `dist/`. `ABI=x86_64` собирает версию для эмулятора.
 
@@ -218,8 +218,8 @@ ANDROID_HOME=/путь/к/sdk bash android/build-apk.sh
 | `installer/` | установщик для Windows и скрипт сборки |
 | `assets/` | иконка приложения (`icon.png`, `icon.ico`, ресурс для exe) |
 
-Позиции и настройки лежат в `%APPDATA%\VPlayer` (Windows),
-`~/Library/Application Support/VPlayer` (macOS), `~/.config/vplayer` (Linux)
+Позиции и настройки лежат в `%APPDATA%\Resumo` (Windows),
+`~/Library/Application Support/Resumo` (macOS), `~/.config/resumo` (Linux)
 или в личной папке приложения (Android).
 
 Весь код плеера на Rust, без C/C++ и без генерации привязок. libVLC — это

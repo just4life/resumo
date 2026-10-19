@@ -1,5 +1,5 @@
 [package]
-name = "vplayer"
+name = "resumo"
 version = "0.1.0"
 edition = "2021"
 description = "Simple modern video player built on libVLC"

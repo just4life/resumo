@@ -1,5 +1,5 @@
 //! Video straight from the hardware decoder, never through the CPU: less
-//! heat and battery for 4K, and HDR shown as HDR. (Taken from VPlayer TV.)
+//! heat and battery for 4K, and HDR shown as HDR. (Taken from Resumo TV.)
 //! libVLC draws through its `AWindow` (from libVLC's own Java part, shipped
 //! in the APK) into
 //!

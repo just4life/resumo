@@ -891,8 +891,8 @@ impl PlayerApp {
             }
         }
         let title = match self.current_title() {
-            Some(t) => format!("{t} — VPlayer"),
-            None => "VPlayer".to_owned(),
+            Some(t) => format!("{t} — Resumo"),
+            None => "Resumo".to_owned(),
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
@@ -993,7 +993,7 @@ impl PlayerApp {
             let (logo, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
             self.paint_app_icon(ui.painter(), logo);
             ui.add_space(2.0);
-            ui.label(RichText::new("VPlayer").size(12.5).color(theme::TEXT));
+            ui.label(RichText::new("Resumo").size(12.5).color(theme::TEXT));
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
