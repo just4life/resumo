@@ -259,6 +259,14 @@ impl PlayerApp {
                 self.prev();
                 return;
             }
+            // One video per press: holding the button doesn't run through the list.
+            Nav::ChannelUp | Nav::ChannelDown if self.is_active() => {
+                let to = if press.nav == Nav::ChannelUp { self.playlist.next_index(false) } else { self.playlist.prev_index() };
+                if let (Some(i), false) = (to, press.repeat) {
+                    self.play_index(i);
+                }
+                return;
+            }
             Nav::Rewind | Nav::Forward if self.is_active() => {
                 let dir = if press.nav == Nav::Rewind { -1 } else { 1 };
                 self.tv_seek(dir, 30_000, press.repeat);

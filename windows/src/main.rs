@@ -4,8 +4,10 @@
 
 mod app;
 mod crop;
+mod fit;
 mod hdr;
 mod hdr_gl;
+mod info;
 mod playlist;
 mod snapshot;
 mod store;
@@ -26,7 +28,7 @@ fn main() -> eframe::Result {
             .with_title("Resumo")
             .with_app_id("resumo")
             .with_inner_size([1180.0, 700.0])
-            .with_min_inner_size([640.0, 380.0])
+            .with_min_inner_size(app::MIN_WINDOW)
             .with_decorations(false)
             .with_icon(eframe::icon_data::from_png_bytes(ICON_PNG).expect("embedded icon is a valid PNG"))
             .with_drag_and_drop(true),

@@ -30,6 +30,10 @@ pub enum Nav {
     Forward,
     /// A digit button: in a video, jumps to that tenth of it, as on YouTube.
     Digit(u8),
+    /// The channel buttons (P+ / P−): the next or previous video straight
+    /// away, as a TV changes channels.
+    ChannelUp,
+    ChannelDown,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +84,9 @@ pub fn take_presses(raw: &mut egui::RawInput, typing: bool, text_focused: bool) 
             Key::MediaStop => Nav::Stop,
             Key::MediaTrackNext => Nav::Next,
             Key::MediaTrackPrevious => Nav::Prev,
+            // Some remotes send these for P+ / P−.
+            Key::PageUp if !typing => Nav::ChannelUp,
+            Key::PageDown if !typing => Nav::ChannelDown,
             Key::Num0 | Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 | Key::Num7 | Key::Num8
             | Key::Num9
                 if !typing =>
@@ -103,8 +110,8 @@ pub fn take_presses(raw: &mut egui::RawInput, typing: bool, text_focused: bool) 
             Keycode::Menu | Keycode::Info | Keycode::ButtonStart => Nav::Menu,
             Keycode::ButtonA | Keycode::ButtonSelect if !typing => Nav::Ok,
             Keycode::ButtonB => Nav::Back,
-            Keycode::ChannelUp => Nav::Prev,
-            Keycode::ChannelDown => Nav::Next,
+            Keycode::ChannelUp => Nav::ChannelUp,
+            Keycode::ChannelDown => Nav::ChannelDown,
             Keycode::Captions => Nav::Menu,
             _ => continue,
         };

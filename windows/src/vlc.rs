@@ -48,6 +48,61 @@ pub struct libvlc_event_t {
     pub p_obj: *mut c_void,
 }
 
+#[repr(C)]
+pub struct libvlc_audio_track_t {
+    pub i_channels: c_uint,
+    pub i_rate: c_uint,
+}
+
+#[repr(C)]
+pub struct libvlc_video_track_t {
+    pub i_height: c_uint,
+    pub i_width: c_uint,
+    pub i_sar_num: c_uint,
+    pub i_sar_den: c_uint,
+    pub i_frame_rate_num: c_uint,
+    pub i_frame_rate_den: c_uint,
+    // Orientation, projection and viewpoint follow; never read.
+}
+
+#[repr(C)]
+pub struct libvlc_media_track_t {
+    pub i_codec: u32,
+    pub i_original_fourcc: u32,
+    pub i_id: c_int,
+    pub i_type: c_int,
+    pub i_profile: c_int,
+    pub i_level: c_int,
+    /// `libvlc_audio_track_t` or `libvlc_video_track_t`, depending on `i_type`.
+    pub details: *mut c_void,
+    pub i_bitrate: c_uint,
+    pub psz_language: *mut c_char,
+    pub psz_description: *mut c_char,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub struct libvlc_media_stats_t {
+    pub i_read_bytes: c_int,
+    pub f_input_bitrate: f32,
+    pub i_demux_read_bytes: c_int,
+    pub f_demux_bitrate: f32,
+    pub i_demux_corrupted: c_int,
+    pub i_demux_discontinuity: c_int,
+    pub i_decoded_video: c_int,
+    pub i_decoded_audio: c_int,
+    pub i_displayed_pictures: c_int,
+    pub i_lost_pictures: c_int,
+    pub i_played_abuffers: c_int,
+    pub i_lost_abuffers: c_int,
+    pub i_sent_packets: c_int,
+    pub i_sent_bytes: c_int,
+    pub f_send_bitrate: f32,
+}
+
+const TRACK_AUDIO: c_int = 0;
+const TRACK_VIDEO: c_int = 1;
+
 pub type libvlc_callback_t = unsafe extern "C" fn(event: *const libvlc_event_t, data: *mut c_void);
 pub type libvlc_video_lock_cb = unsafe extern "C" fn(opaque: *mut c_void, planes: *mut *mut c_void) -> *mut c_void;
 pub type libvlc_video_unlock_cb =
@@ -80,10 +135,15 @@ extern "C" {
     fn libvlc_media_new_path(inst: *mut libvlc_instance_t, path: *const c_char) -> *mut libvlc_media_t;
     fn libvlc_media_new_location(inst: *mut libvlc_instance_t, mrl: *const c_char) -> *mut libvlc_media_t;
     fn libvlc_media_release(md: *mut libvlc_media_t);
+    fn libvlc_media_tracks_get(md: *mut libvlc_media_t, tracks: *mut *mut *mut libvlc_media_track_t) -> c_uint;
+    fn libvlc_media_tracks_release(tracks: *mut *mut libvlc_media_track_t, count: c_uint);
+    fn libvlc_media_get_codec_description(type_: c_int, codec: u32) -> *const c_char;
+    fn libvlc_media_get_stats(md: *mut libvlc_media_t, stats: *mut libvlc_media_stats_t) -> c_int;
 
     fn libvlc_media_player_new(inst: *mut libvlc_instance_t) -> *mut libvlc_media_player_t;
     fn libvlc_media_player_release(mp: *mut libvlc_media_player_t);
     fn libvlc_media_player_set_media(mp: *mut libvlc_media_player_t, md: *mut libvlc_media_t);
+    fn libvlc_media_player_get_media(mp: *mut libvlc_media_player_t) -> *mut libvlc_media_t;
     fn libvlc_media_player_event_manager(mp: *mut libvlc_media_player_t) -> *mut libvlc_event_manager_t;
     fn libvlc_media_player_is_playing(mp: *mut libvlc_media_player_t) -> c_int;
     fn libvlc_media_player_play(mp: *mut libvlc_media_player_t) -> c_int;
@@ -125,6 +185,7 @@ extern "C" {
     fn libvlc_video_set_key_input(mp: *mut libvlc_media_player_t, on: c_uint);
     fn libvlc_video_get_size(mp: *mut libvlc_media_player_t, num: c_uint, px: *mut c_uint, py: *mut c_uint) -> c_int;
     fn libvlc_video_set_mouse_input(mp: *mut libvlc_media_player_t, on: c_uint);
+    fn libvlc_video_get_track(mp: *mut libvlc_media_player_t) -> c_int;
     fn libvlc_video_get_spu(mp: *mut libvlc_media_player_t) -> c_int;
     fn libvlc_video_set_spu(mp: *mut libvlc_media_player_t, id: c_int) -> c_int;
     fn libvlc_video_get_spu_description(mp: *mut libvlc_media_player_t) -> *mut libvlc_track_description_t;
@@ -209,6 +270,61 @@ unsafe fn collect_tracks(list: *mut libvlc_track_description_t) -> Vec<Track> {
         libvlc_track_description_list_release(list);
     }
     out
+}
+
+/// What the info overlay shows about the video or audio stream being played.
+#[derive(Clone, Debug, Default)]
+pub struct StreamInfo {
+    /// FourCC, e.g. `h264`.
+    pub fourcc: String,
+    /// libVLC's long name for the codec, e.g. "H264 - MPEG-4 AVC (part 10)".
+    pub description: String,
+    pub profile: i32,
+    /// Bits per second, when the container says.
+    pub bitrate: u32,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f32,
+    pub channels: u32,
+    pub rate: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MediaInfo {
+    pub video: Option<StreamInfo>,
+    pub audio: Option<StreamInfo>,
+    /// Bits per second currently read from the file or stream.
+    pub bitrate: f32,
+}
+
+fn fourcc(code: u32) -> String {
+    code.to_le_bytes().iter().map(|&b| if b.is_ascii_graphic() { b as char } else { ' ' }).collect::<String>().trim().to_owned()
+}
+
+unsafe fn stream_info(t: &libvlc_media_track_t) -> StreamInfo {
+    let desc = libvlc_media_get_codec_description(t.i_type, t.i_codec);
+    let mut info = StreamInfo {
+        fourcc: fourcc(t.i_codec),
+        description: if desc.is_null() { String::new() } else { CStr::from_ptr(desc).to_string_lossy().into_owned() },
+        profile: t.i_profile,
+        bitrate: t.i_bitrate,
+        ..Default::default()
+    };
+    if !t.details.is_null() {
+        if t.i_type == TRACK_VIDEO {
+            let v = &*(t.details as *const libvlc_video_track_t);
+            info.width = v.i_width;
+            info.height = v.i_height;
+            if v.i_frame_rate_den > 0 {
+                info.fps = v.i_frame_rate_num as f32 / v.i_frame_rate_den as f32;
+            }
+        } else if t.i_type == TRACK_AUDIO {
+            let a = &*(t.details as *const libvlc_audio_track_t);
+            info.channels = a.i_channels;
+            info.rate = a.i_rate;
+        }
+    }
+    info
 }
 
 /// An audio output device (speakers, headphones, HDMI, ...).
@@ -431,6 +547,40 @@ impl MediaPlayer {
         if let Ok(c) = CString::new(id) {
             unsafe { libvlc_audio_output_device_set(self.raw, std::ptr::null(), c.as_ptr()) }
         }
+    }
+
+    /// Codecs and sizes of the playing video and audio tracks, and the bitrate.
+    pub fn media_info(&self) -> MediaInfo {
+        let mut out = MediaInfo::default();
+        unsafe {
+            let md = libvlc_media_player_get_media(self.raw);
+            if md.is_null() {
+                return out;
+            }
+            let (video_id, audio_id) = (libvlc_video_get_track(self.raw), libvlc_audio_get_track(self.raw));
+            let mut tracks = std::ptr::null_mut();
+            let n = libvlc_media_tracks_get(md, &mut tracks);
+            if !tracks.is_null() {
+                let list: Vec<&libvlc_media_track_t> =
+                    std::slice::from_raw_parts(tracks, n as usize).iter().filter_map(|t| t.as_ref()).collect();
+                // The selected track, or the first of its kind if libVLC hasn't said yet.
+                let pick = |kind: c_int, id: c_int| {
+                    let of_kind = || list.iter().filter(|t| t.i_type == kind);
+                    of_kind().find(|t| t.i_id == id).or_else(|| (id != -1).then(|| of_kind().next()).flatten())
+                };
+                out.video = pick(TRACK_VIDEO, video_id).map(|t| stream_info(t));
+                out.audio = pick(TRACK_AUDIO, audio_id).map(|t| stream_info(t));
+                libvlc_media_tracks_release(tracks, n);
+            }
+            let mut stats = libvlc_media_stats_t::default();
+            if libvlc_media_get_stats(md, &mut stats) != 0 {
+                // libVLC reports bytes per microsecond.
+                let rate = if stats.f_demux_bitrate > 0.0 { stats.f_demux_bitrate } else { stats.f_input_bitrate };
+                out.bitrate = rate * 8_000_000.0;
+            }
+            libvlc_media_release(md);
+        }
+        out
     }
 
     /// Loads an external subtitle file into the current media and selects it.

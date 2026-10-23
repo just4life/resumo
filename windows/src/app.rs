@@ -14,6 +14,8 @@ use egui::{
 use crate::crop::{self, Crop};
 use crate::hdr::{self, HdrInfo, Transfer};
 use crate::hdr_gl;
+use crate::fit;
+use crate::info;
 use crate::playlist::{self, Playlist, Repeat};
 use crate::snapshot::{self, Image};
 use crate::store::Store;
@@ -35,6 +37,10 @@ const HDR_WHITE_NITS: f32 = 290.0;
 const HDR_BRIGHTNESS: std::ops::RangeInclusive<i32> = 50..=150;
 /// How long to wait for the GPU to hand back an HDR frame being saved.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often the info overlay re-reads the bitrate.
+const INFO_REFRESH: Duration = Duration::from_secs(1);
+/// Smallest window, in points (also set on the viewport in `main`).
+pub const MIN_WINDOW: egui::Vec2 = vec2(640.0, 380.0);
 
 /// A frame to save once the HDR renderer has drawn it off screen.
 struct PendingCapture {
@@ -136,6 +142,16 @@ pub struct PlayerApp {
     saved_tx: mpsc::Sender<Result<PathBuf, String>>,
     saved_rx: mpsc::Receiver<Result<PathBuf, String>>,
     last_saved: Option<PathBuf>,
+
+    /// The Tab overlay with codecs and bitrate.
+    show_info: bool,
+    info: Option<(vlc::MediaInfo, Instant)>,
+    /// Tab was pressed (taken out of egui's input, where it moves focus).
+    tab_pressed: bool,
+    /// Size the window to the next video frame.
+    fit_pending: bool,
+    /// Where the video was drawn last frame.
+    video_rect: Rect,
 }
 
 impl PlayerApp {
@@ -209,6 +225,11 @@ impl PlayerApp {
             saved_tx,
             saved_rx,
             last_saved: None,
+            show_info: false,
+            info: None,
+            tab_pressed: false,
+            fit_pending: false,
+            video_rect: Rect::NOTHING,
         };
         app.add_paths(files, true);
         Ok(app)
@@ -243,6 +264,8 @@ impl PlayerApp {
         self.pending_subtitles.clear();
         self.resume_at = self.store.position(&location);
         self.resume_quietly = false;
+        self.info = None;
+        self.fit_pending = true;
         if !self.player.play() {
             self.notify("Не удалось начать воспроизведение");
         }
@@ -253,6 +276,8 @@ impl PlayerApp {
         let Some(i) = self.playlist.current else { return };
         let t = self.player.time();
         self.play_index(i);
+        // Same video: keep the window as the user left it.
+        self.fit_pending = false;
         if t > 0 {
             self.resume_at = Some(t);
             self.resume_quietly = true;
@@ -740,6 +765,69 @@ impl PlayerApp {
         if ctrl && pressed(Key::E) {
             self.save_frame(ctx);
         }
+        if std::mem::take(&mut self.tab_pressed) {
+            self.toggle_info();
+        }
+    }
+
+    fn toggle_info(&mut self) {
+        self.show_info = !self.show_info;
+        self.info = None;
+    }
+
+    /// Resizes the window to a video that just started (not when the user has
+    /// it maximised or fullscreen).
+    fn fit_window(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
+        if !self.fit_pending || !self.has_picture() || self.video_rect.width() < 1.0 {
+            return;
+        }
+        self.fit_pending = false;
+        let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+        if self.fullscreen || maximized {
+            return;
+        }
+        let (w, h) = self.frame_size;
+        let uv = self.crop.uv_rect(w, h);
+        fit::fit(frame, ctx, self.video_rect, vec2(uv.width() * w, uv.height() * h), MIN_WINDOW);
+    }
+
+    /// The Tab overlay in the top-left corner; returns its bottom edge.
+    fn info_overlay(&mut self, ui: &mut Ui, ctx: &egui::Context, rect: Rect) -> f32 {
+        let top = rect.top() + if self.fullscreen { 64.0 } else { 20.0 };
+        if !self.show_info || !self.is_active() {
+            return top - 10.0;
+        }
+        if self.info.as_ref().is_none_or(|(_, at)| at.elapsed() >= INFO_REFRESH) {
+            self.info = Some((self.player.media_info(), Instant::now()));
+        }
+        ctx.request_repaint_after(INFO_REFRESH);
+        let Some((media, _)) = &self.info else { return top - 10.0 };
+        let title = self.current_title().unwrap_or_default();
+        let rows = info::rows(&title, media, self.frame_size, self.hdr, self.hdr_active);
+
+        let painter = ui.painter();
+        let font = FontId::proportional(15.0);
+        let max_w = (rect.width() - 80.0).max(120.0);
+        let labels: Vec<_> =
+            rows.iter().map(|(l, _)| painter.layout_no_wrap(format!("{l}:"), font.clone(), theme::TEXT_DIM)).collect();
+        let label_w = labels.iter().map(|g| g.size().x).fold(0.0, f32::max) + 10.0;
+        let values: Vec<_> = rows
+            .iter()
+            .map(|(_, v)| painter.layout(v.clone(), font.clone(), Color32::WHITE, (max_w - label_w).max(60.0)))
+            .collect();
+        let width = label_w + values.iter().map(|g| g.size().x).fold(0.0, f32::max);
+        let height: f32 = values.iter().map(|g| g.size().y + 4.0).sum::<f32>() - 4.0;
+        let pad = vec2(18.0, 12.0);
+        let panel = Rect::from_min_size(pos2(rect.left() + 20.0, top), vec2(width, height) + pad * 2.0);
+        painter.rect_filled(panel, 10.0, Color32::from_black_alpha(170));
+        let mut y = panel.top() + pad.y;
+        for (label, value) in labels.into_iter().zip(values) {
+            let h = value.size().y;
+            painter.galley(pos2(panel.left() + pad.x, y), label, theme::TEXT_DIM);
+            painter.galley(pos2(panel.left() + pad.x + label_w, y), value, Color32::WHITE);
+            y += h + 4.0;
+        }
+        panel.bottom()
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
@@ -1281,6 +1369,7 @@ impl PlayerApp {
 
     fn video_area(&mut self, ui: &mut Ui, ctx: &egui::Context) {
         let rect = ui.max_rect();
+        self.video_rect = rect;
         let resp = ui.allocate_rect(rect, Sense::click_and_drag());
         self.wheel_volume(ctx, rect);
         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
@@ -1361,6 +1450,11 @@ impl PlayerApp {
                 ui.close();
                 self.open_frames_folder();
             }
+            let info = if self.show_info { "Скрыть информацию" } else { "Информация о видео" };
+            if ui.add_enabled(self.is_active(), egui::Button::new(info).shortcut_text("Tab")).clicked() {
+                ui.close();
+                self.toggle_info();
+            }
             ui.separator();
             if ui.button("Открыть файлы…").clicked() {
                 ui.close();
@@ -1377,6 +1471,7 @@ impl PlayerApp {
         });
 
         self.overlay_controls(ui, ctx, rect);
+        let info_bottom = self.info_overlay(ui, ctx, rect);
 
         // Short on-screen message (track switched, crop changed, ...).
         if let Some((text, at)) = &self.status {
@@ -1384,9 +1479,8 @@ impl PlayerApp {
             if age < 2.0 {
                 let alpha = (1.0 - (age - 1.5).max(0.0) * 2.0).clamp(0.0, 1.0);
                 let galley = ui.painter().layout_no_wrap(text.clone(), FontId::proportional(20.0), Color32::WHITE);
-                // In fullscreen the video title sits in the top-left corner; stay below it.
-                let top = if self.fullscreen { 64.0 } else { 20.0 };
-                let bubble = Rect::from_min_size(rect.min + vec2(20.0, top), galley.size() + vec2(36.0, 20.0));
+                // Below the info overlay, or the video title in fullscreen.
+                let bubble = Rect::from_min_size(pos2(rect.left() + 20.0, info_bottom + 10.0), galley.size() + vec2(36.0, 20.0));
                 ui.painter().rect_filled(bubble, 10.0, Color32::from_black_alpha((170.0 * alpha) as u8));
                 ui.painter().galley(bubble.min + vec2(18.0, 10.0), galley, Color32::WHITE.gamma_multiply(alpha));
                 ctx.request_repaint();
@@ -1483,6 +1577,19 @@ impl eframe::App for PlayerApp {
         self.store.save();
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.url_dialog.is_some() {
+            return;
+        }
+        raw.events.retain(|e| match e {
+            egui::Event::Key { key: Key::Tab, pressed, modifiers, .. } if modifiers.is_none() => {
+                self.tab_pressed |= *pressed;
+                false
+            }
+            _ => true,
+        });
+    }
+
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
@@ -1515,6 +1622,7 @@ impl eframe::App for PlayerApp {
                 .show(ui, |ui| self.playlist_panel(ui));
         }
         egui::CentralPanel::no_frame().show(ui, |ui| self.video_area(ui, &ctx));
+        self.fit_window(frame, &ctx);
         self.url_window(&ctx);
         self.resize_edges(&ctx);
     }
