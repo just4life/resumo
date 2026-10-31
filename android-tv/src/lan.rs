@@ -564,6 +564,78 @@ fn save_login(server: String, login: Login) {
     });
 }
 
+// ------------------------------------------------------------ recent places
+
+const RECENT_PLACES: usize = 5;
+
+fn places_file() -> Option<std::path::PathBuf> {
+    crate::store::config_dir().map(|d| d.join("network-places.tsv"))
+}
+
+/// Servers, shares and typed addresses opened from the top of "Сеть",
+/// newest first. Before any, the servers a login was saved for.
+pub fn recent_places() -> Vec<NetItem> {
+    if let Some(text) = places_file().and_then(|p| std::fs::read_to_string(p).ok()) {
+        let mut places: Vec<NetItem> = Vec::new();
+        for (mrl, name) in text.lines().filter_map(|l| l.split_once('\t')) {
+            // Written before places were told apart regardless of case.
+            if !places.iter().any(|p| same_place(&p.mrl, mrl)) {
+                places.push(NetItem { mrl: mrl.to_owned(), name: name.to_owned(), is_dir: true });
+            }
+        }
+        return places;
+    }
+    let mut logins = saved_logins();
+    logins.reverse();
+    // Folders to open: a media server's login is for its files.
+    logins.retain(|l| !l.starts_with("http"));
+    logins.into_iter().take(RECENT_PLACES).map(|mrl| NetItem { name: name_from_mrl(&mrl), mrl, is_dir: true }).collect()
+}
+
+/// Puts `place` first among [`recent_places`].
+pub fn remember_place(place: &NetItem) {
+    let Some(path) = places_file() else { return };
+    let mut places = recent_places();
+    places.retain(|p| !same_place(&p.mrl, &place.mrl));
+    places.insert(0, place.clone());
+    places.truncate(RECENT_PLACES);
+    write_places(&path, &places);
+}
+
+/// Takes `mrl` off [`recent_places`].
+pub fn forget_place(mrl: &str) {
+    let Some(path) = places_file() else { return };
+    let mut places = recent_places();
+    places.retain(|p| !same_place(&p.mrl, mrl));
+    write_places(&path, &places);
+}
+
+fn write_places(path: &std::path::Path, places: &[NetItem]) {
+    let clean = |s: &str| s.replace(['\t', '\n'], " ");
+    let text: String = places.iter().map(|p| format!("{}\t{}\n", clean(&p.mrl), clean(&p.name))).collect();
+    let _ = std::fs::write(path, text);
+}
+
+/// Whether two addresses are the same place: a server's name is the same in
+/// any case ("smb://HOMEPC" is "smb://homepc"), and so are a shared
+/// folder's share and path, as on Windows.
+pub fn same_place(a: &str, b: &str) -> bool {
+    let key = |mrl: &str| {
+        let mrl = mrl.trim_end_matches('/');
+        let Some((scheme, rest)) = mrl.split_once("://") else { return mrl.to_owned() };
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let path = if scheme.eq_ignore_ascii_case("smb") { path.to_lowercase() } else { path.to_owned() };
+        format!("{}://{}/{path}", scheme.to_lowercase(), host.to_lowercase())
+    };
+    key(a) == key(b)
+}
+
+/// The server a login is saved for that `mrl` is on ("smb://nas"), if any.
+pub fn login_saved_for(mrl: &str) -> Option<String> {
+    let key = server_key(mrl)?;
+    saved_logins().contains(&key).then_some(key)
+}
+
 /// The servers a login is remembered for ("smb://nas").
 pub fn saved_logins() -> Vec<String> {
     with_logins(|logins| logins.iter().map(|(s, _)| s.clone()).collect())
@@ -670,6 +742,15 @@ mod tests {
         assert_eq!(server_key("upnp://http://192.168.1.2:8200/x"), None);
         assert_eq!(server_key("/storage/emulated/0/a.mkv"), None);
         assert_eq!(unescape(&escape("a\tb\\c\nd")), "a\tb\\c\nd");
+    }
+
+    #[test]
+    fn same_place_in_any_case() {
+        assert!(same_place("smb://homepc", "smb://HOMEPC/"));
+        assert!(same_place("SMB://NAS/Movies", "smb://nas/movies"));
+        assert!(!same_place("smb://nas/Movies", "smb://nas/TV"));
+        assert!(same_place("http://NAS:8200/Video", "http://nas:8200/Video"));
+        assert!(!same_place("http://nas/Video", "http://nas/video"));
     }
 
     #[test]

@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Stroke, Ui};
 
-use super::{format_time, track_name, trim_float, PlayerApp, SPEEDS};
-use crate::browser::{Action, Outcome};
-use crate::crop::{self, Crop};
+use super::{format_time, track_name, trim_float, BarSearch, PlayerApp, SPEEDS};
+use crate::browser::{Action, Browser, Outcome};
+use crate::crop;
 use crate::platform;
 use crate::playlist::Repeat;
 use crate::theme::{self, Icon};
@@ -136,10 +136,10 @@ enum PanelRow {
     SubFile,
     SubDelay,
     Zoom(Zoom),
-    CutBars,
+    /// How the search for black bars went; OK looks again.
+    Bars,
     Hdr,
     Output,
-    Crop(Crop),
     Speed(f32),
     Repeat,
     Shuffle,
@@ -290,10 +290,14 @@ impl PlayerApp {
             match b.handle(press, self.android.storage_ok) {
                 Action::None => {}
                 Action::AskAccess => platform::request_storage_access(),
-                Action::Close => self.close_browser(),
+                Action::Close => drop(self.close_browser()),
                 Action::Keep(o) => self.apply_outcome(o),
                 Action::Done(o) => {
-                    self.close_browser();
+                    let plays = matches!(o, Outcome::Files(_, Some(_)) | Outcome::Network(_, Some(_)));
+                    let browser = self.close_browser();
+                    if plays {
+                        self.android.browser_behind = browser;
+                    }
                     self.apply_outcome(o);
                 }
             }
@@ -306,20 +310,28 @@ impl PlayerApp {
         }
     }
 
-    fn close_browser(&mut self) {
-        if let Some(b) = self.android.browser.take() {
-            if !b.on_network() {
-                self.android.last_dir = Some(b.dir().to_path_buf());
-            }
+    fn close_browser(&mut self) -> Option<Browser> {
+        let b = self.android.browser.take()?;
+        if !b.on_network() {
+            self.android.last_dir = Some(b.dir().to_path_buf());
         }
+        Some(b)
     }
 
-    /// Stops and goes back to the home screen (the position is kept).
+    /// Stops and goes back to where the video was chosen: the folder it is
+    /// in, or the home screen (the position is kept).
     fn tv_stop(&mut self) {
+        let location = self.playlist.current.and_then(|i| self.playlist.items.get(i)).map(|it| it.location.clone());
         self.stop();
         self.android.tv.panel = None;
         self.android.tv.seek = None;
         self.android.tv.home_recent = (!self.android.history.entries.is_empty()).then_some(0);
+        if let Some(mut b) = self.android.browser_behind.take() {
+            if let Some(location) = location {
+                b.focus_on(&location, self.android.storage_ok);
+            }
+            self.android.browser = Some(b);
+        }
     }
 
     fn apply_outcome(&mut self, outcome: Outcome) {
@@ -550,18 +562,15 @@ impl PlayerApp {
             Panel::Picture => {
                 rows.push(PanelRow::Header("Масштаб"));
                 rows.extend(Zoom::ALL.iter().map(|(z, _)| PanelRow::Zoom(*z)));
-                // Black bars are found in the picture's pixels, which only the
-                // CPU path has; the texture path turns HDR into SDR instead,
-                // and the video layer passes HDR on to the TV.
-                match &self.android.gpu {
-                    None => rows.push(PanelRow::CutBars),
-                    Some(g) if !g.is_layer() => rows.push(PanelRow::Hdr),
-                    Some(_) => {}
+                if self.cuts_bars() {
+                    rows.push(PanelRow::Bars);
+                }
+                // The texture path turns HDR into SDR; the video layer passes
+                // HDR on to the TV.
+                if self.android.gpu.as_ref().is_some_and(|g| !g.is_layer()) {
+                    rows.push(PanelRow::Hdr);
                 }
                 rows.push(PanelRow::Output);
-                rows.push(PanelRow::Header("Кадрирование"));
-                rows.push(PanelRow::Crop(Crop::None));
-                rows.extend(crop::PRESETS.iter().map(|(_, c)| PanelRow::Crop(*c)));
             }
             Panel::Speed => rows.extend(SPEEDS.iter().map(|s| PanelRow::Speed(*s))),
             Panel::Playlist => {
@@ -607,12 +616,9 @@ impl PlayerApp {
                 self.open_subtitle_dialog();
             }
             PanelRow::Zoom(z) => self.set_zoom(z),
-            PanelRow::CutBars => {
-                let cut = !self.android.view.cut_bars;
-                self.android.view.cut_bars = cut;
-                self.android.view.save();
-                self.android.bars.reset();
-                self.notify(if cut { "Чёрные полосы убираются" } else { "Чёрные полосы не убираются" });
+            PanelRow::Bars => {
+                self.search_bars_again();
+                self.notify("Ищу чёрные полосы заново");
             }
             PanelRow::Hdr => {
                 let next = match self.android.view.hdr_to_sdr {
@@ -635,7 +641,6 @@ impl PlayerApp {
                 self.notify(format!("Вывод видео: {}. Приложение закроется, откройте его снова", self.output_label()));
                 self.android.exit_at = Some(Instant::now() + Duration::from_secs(3));
             }
-            PanelRow::Crop(c) => self.set_crop(c),
             PanelRow::Speed(s) => {
                 self.rate = s;
                 self.player.set_rate(s);
@@ -722,6 +727,10 @@ impl PlayerApp {
     // ---------------------------------------------------------------- drawing
 
     pub(super) fn tv_home(&mut self, ui: &mut Ui) {
+        // Home is where "Назад" goes from now on.
+        if self.android.browser.is_none() {
+            self.android.browser_behind = None;
+        }
         let screen = ui.max_rect();
         let p = ui.painter().clone();
         p.rect_filled(screen, 0.0, theme::BG);
@@ -932,7 +941,7 @@ impl PlayerApp {
             let r = Rect::from_center_size(pos2(x + size / 2.0, cy), vec2(size, size));
             let focused = tv.panel.is_none() && tv.bar_focus == BarFocus::Button(i);
             let on = match b {
-                Button::Picture => self.crop != Crop::None || self.android.view.zoom != Zoom::Fit || self.android.view.cut_bars,
+                Button::Picture => self.android.view.zoom != Zoom::Fit,
                 Button::Playlist => tv.panel == Some(Panel::Playlist),
                 _ => tv.panel.is_some_and(|p| b.panel() == Some(p)),
             };
@@ -1015,13 +1024,9 @@ impl PlayerApp {
             }
             PanelRow::SubFile => tv::row(p, r, Some((Icon::Folder, theme::ACCENT)), "Загрузить из файла", Trail::None, focused, false),
             PanelRow::Zoom(z) => tv::row(p, r, None, z.label(), Trail::Check(current), focused, false),
-            PanelRow::CutBars => tv::row(p, r, None, "Убирать чёрные полосы", Trail::Switch(self.android.view.cut_bars), focused, false),
+            PanelRow::Bars => tv::row(p, r, None, "Чёрные полосы в кадре", Trail::Value(&self.bars_label()), focused, false),
             PanelRow::Hdr => tv::row(p, r, None, "HDR → SDR", Trail::Value(&self.hdr_label()), focused, false),
             PanelRow::Output => tv::row(p, r, None, "Вывод видео", Trail::Value(&self.output_label()), focused, false),
-            PanelRow::Crop(c) => {
-                let label = if *c == Crop::None { "Без кадрирования".to_owned() } else { c.label() };
-                tv::row(p, r, None, &label, Trail::Check(self.crop == *c), focused, false)
-            }
             PanelRow::Speed(s) => {
                 let label = if *s == 1.0 { "Обычная".to_owned() } else { format!("{}×", trim_float(*s)) };
                 tv::row(p, r, None, &label, Trail::Check(current), focused, false)
@@ -1139,6 +1144,25 @@ impl PlayerApp {
         .into()
     }
 
+    /// What became of black bars drawn into the video.
+    fn bars_label(&self) -> String {
+        let found = self.android.bars.content() != Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        // The CPU path looks at every picture.
+        if self.texture.is_some() {
+            return if found { "срезаны" } else { "нет" }.into();
+        }
+        match self.android.bar_search {
+            BarSearch::NotYet => "ищу…".into(),
+            BarSearch::Running => match self.android.probe.as_ref().map(|p| p.progress()) {
+                Some((at, of)) => format!("ищу… {}/{of}", at.min(of)),
+                None => "ищу…".into(),
+            },
+            _ if found => "срезаны".into(),
+            BarSearch::Done => "нет".into(),
+            BarSearch::Failed => "не удалось проверить".into(),
+        }
+    }
+
     fn hdr_label(&self) -> String {
         match self.android.view.hdr_to_sdr {
             Some(true) => "Вкл".into(),
@@ -1174,6 +1198,9 @@ impl PlayerApp {
             self.android.gpu_picture = None;
             self.android.gpu_subtitles = None;
             self.android.layer_picture = false;
+            if let Some(g) = &mut self.android.gpu {
+                g.place_layer_whole();
+            }
             if self.video_id.is_some() && self.texture.is_none() {
                 self.video_id = None;
             }
@@ -1199,6 +1226,9 @@ impl PlayerApp {
         let Some(gpu) = &mut self.android.gpu else { return };
         let shown = gpu.frame(&gl, frame, window, size, hdr);
         self.android.layer_picture = gpu.is_layer() && size.is_some();
+        if size.is_none() {
+            gpu.place_layer_whole();
+        }
         if shown.reattached {
             self.player.restart_video();
         }

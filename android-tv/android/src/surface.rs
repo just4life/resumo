@@ -20,6 +20,8 @@
 //! `VideoHelper`, made without its constructor: with no player of its own
 //! it just takes note of the layout and does nothing.
 
+use std::time::{Duration, Instant};
+
 use eframe::glow::{self, HasContext};
 use jni::objects::{GlobalRef, JFloatArray, JObject, JValue};
 
@@ -28,6 +30,10 @@ use crate::platform;
 const TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 
 /// Biggest picture kept: the TV's window is drawn at no more than 1080p.
+/// When to move the layer a little after a new video is opened, in
+/// milliseconds (see [`SurfaceVideo::reset`]).
+const NUDGES: [u64; 3] = [1000, 3000, 6000];
+
 const MAX_W: u32 = 1920;
 const MAX_H: u32 = 1080;
 
@@ -106,6 +112,8 @@ struct VideoView {
     rect: Option<[i32; 4]>,
     /// Frames until `AWindow` is checked for being attached again.
     check_in: u32,
+    /// When to move it a little (see [`SurfaceVideo::reset`]).
+    nudges: Vec<Instant>,
 }
 
 pub struct SurfaceVideo {
@@ -205,7 +213,7 @@ impl SurfaceVideo {
                 awindow,
                 listener,
                 video: layer(video, video_oes),
-                view: view.map(|view| VideoView { view, rect: None, check_in: 0 }),
+                view: view.map(|view| VideoView { view, rect: None, check_in: 0, nudges: Vec::new() }),
                 subs: layer(subs, subs_oes),
                 matrix,
                 program,
@@ -225,12 +233,18 @@ impl SurfaceVideo {
 
     /// Puts the video layer at `rect` (window pixels: the whole picture,
     /// even where it is cut off), if it isn't there already.
-    pub fn place_layer(&mut self, rect: [i32; 4]) {
+    pub fn place_layer(&mut self, mut rect: [i32; 4]) {
         let Some(v) = &mut self.view else { return };
+        if v.nudges.first().is_some_and(|t| Instant::now() >= *t) {
+            v.nudges.remove(0);
+            // Two pixels taller until the next frame puts it back.
+            rect[3] += 2;
+        }
         if v.rect == Some(rect) {
             return;
         }
         v.rect = Some(rect);
+        log::debug!("video layer at {rect:?}");
         let view = v.view.clone();
         platform::on_main_thread(move || {
             platform::with_env(|env, _| {
@@ -245,6 +259,16 @@ impl SurfaceVideo {
         });
     }
 
+    /// Puts the layer back over the whole window, as it starts, while no
+    /// video is in it. Some TVs only fit a new video's picture to the layer
+    /// when the layer moves: placed afresh for each video, the zoom of the
+    /// one before isn't lost on the next.
+    pub fn place_layer_whole(&mut self) {
+        if self.window.0 > 0 && self.window.1 > 0 {
+            self.place_layer([0, 0, self.window.0, self.window.1]);
+        }
+    }
+
     /// The `AWindow` for `libvlc_media_player_set_android_context`.
     pub fn awindow(&self) -> *mut std::ffi::c_void {
         self.awindow.as_obj().as_raw() as *mut _
@@ -254,6 +278,14 @@ impl SurfaceVideo {
     pub fn reset(&mut self) {
         self.has_picture = false;
         self.has_subtitles = false;
+        // Some TVs place a new video by the layer's size only when it changes
+        // after the decoder started, as it does for the first video: the zoom
+        // was lost on the next episode. Moved a little a few times while the
+        // video starts, the layer is placed afresh for it.
+        if let Some(v) = &mut self.view {
+            let now = Instant::now();
+            v.nudges = NUDGES.iter().map(|ms| now + Duration::from_millis(*ms)).collect();
+        }
     }
 
     /// Takes the newest frames from the decoder (`video` is the picture's

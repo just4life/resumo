@@ -41,7 +41,14 @@ pub struct Press {
     pub nav: Nav,
     /// The button is being held down.
     pub repeat: bool,
+    /// OK held down for a moment: a row's own menu, where it has one;
+    /// elsewhere it is just OK.
+    pub long: bool,
 }
+
+/// The remote's OK while it is down: since when, and whether it was held
+/// long enough to have counted.
+static OK_DOWN: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
 
 /// Takes the remote's key presses out of `raw`, so egui's own keyboard
 /// focus doesn't act on them as well. With `typing` (a text field is on
@@ -59,7 +66,7 @@ pub fn take_presses(raw: &mut egui::RawInput, typing: bool, text_focused: bool) 
             raw.events.remove(i);
             raw.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::Enter, pressed: false, .. }));
         }
-        out.push(Press { nav: Nav::Ok, repeat: false });
+        out.push(Press { nav: Nav::Ok, repeat: false, long: false });
     }
     if typing {
         // Down / up move between the text field and its buttons, the way Tab does.
@@ -72,12 +79,37 @@ pub fn take_presses(raw: &mut egui::RawInput, typing: bool, text_focused: bool) 
     }
     raw.events.retain(|e| {
         let egui::Event::Key { key, pressed, repeat, .. } = e else { return true };
+        if matches!(key, Key::Enter | Key::Space) {
+            // OK counts when let go, or once held until the remote repeats it
+            // (a second press with no release between: egui doesn't pass on
+            // the repeat flag).
+            let mut down = OK_DOWN.lock().unwrap();
+            if typing {
+                if !*pressed {
+                    *down = None;
+                }
+                return true;
+            }
+            match (*pressed, *down) {
+                (true, Some((since, false))) if since.elapsed() < std::time::Duration::from_secs(3) => {
+                    *down = Some((since, true));
+                    out.push(Press { nav: Nav::Ok, repeat: false, long: true });
+                }
+                (true, Some((_, true))) => {}
+                (true, _) => *down = Some((std::time::Instant::now(), false)),
+                (false, Some((_, false))) => {
+                    *down = None;
+                    out.push(Press { nav: Nav::Ok, repeat: false, long: false });
+                }
+                (false, _) => *down = None,
+            }
+            return false;
+        }
         let nav = match key {
             Key::ArrowUp if !typing => Nav::Up,
             Key::ArrowDown if !typing => Nav::Down,
             Key::ArrowLeft if !typing => Nav::Left,
             Key::ArrowRight if !typing => Nav::Right,
-            Key::Enter | Key::Space if !typing => Nav::Ok,
             Key::BrowserBack => Nav::Back,
             Key::Escape if !typing => Nav::Back,
             Key::MediaPlayPause => Nav::PlayPause,
@@ -97,7 +129,7 @@ pub fn take_presses(raw: &mut egui::RawInput, typing: bool, text_focused: bool) 
             _ => return true,
         };
         if *pressed {
-            out.push(Press { nav, repeat: *repeat });
+            out.push(Press { nav, repeat: *repeat, long: false });
         }
         false
     });
@@ -115,7 +147,7 @@ pub fn take_presses(raw: &mut egui::RawInput, typing: bool, text_focused: bool) 
             Keycode::Captions => Nav::Menu,
             _ => continue,
         };
-        out.push(Press { nav, repeat });
+        out.push(Press { nav, repeat, long: false });
     }
     out
 }

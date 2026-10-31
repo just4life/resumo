@@ -117,6 +117,10 @@ mod win {
     const WM_COMMAND: u32 = 0x0111;
     const WM_NCCALCSIZE: u32 = 0x0083;
     const WM_NCACTIVATE: u32 = 0x0086;
+    const WM_SETTEXT: u32 = 0x000C;
+    const WM_SETICON: u32 = 0x0080;
+    const GWL_STYLE: i32 = -16;
+    const WS_VISIBLE: isize = 0x1000_0000;
     const MONITOR_DEFAULTTONULL: u32 = 0;
     const THBN_CLICKED: usize = 0x1800;
     const THB_ICON: u32 = 0x2;
@@ -220,6 +224,8 @@ mod win {
     extern "system" {
         fn RegisterWindowMessageW(name: *const u16) -> u32;
         fn GetSystemMetrics(index: i32) -> i32;
+        fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
+        fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, value: isize) -> isize;
         fn CreateIconIndirect(info: *const IconInfo) -> Handle;
         fn DestroyIcon(icon: Handle) -> i32;
         fn MonitorFromRect(rect: *const WinRect, flags: u32) -> Handle;
@@ -258,6 +264,18 @@ mod win {
         // in fullscreen the client area simply takes the whole monitor.
         if msg == WM_NCACTIVATE {
             return DefSubclassProc(hwnd, msg, wparam, -1);
+        }
+        // Changing the title or icon makes DefWindowProc draw a classic caption
+        // straight onto the window, which flashes over the video. Hiding the
+        // window for the duration of the call (without redrawing) skips that.
+        if msg == WM_SETTEXT || msg == WM_SETICON {
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            if style & WS_VISIBLE != 0 {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style & !WS_VISIBLE);
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+                return result;
+            }
         }
         if msg == WM_NCCALCSIZE && wparam != 0 {
             // The first field of NCCALCSIZE_PARAMS is the proposed window rect;

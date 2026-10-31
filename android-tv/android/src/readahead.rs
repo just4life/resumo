@@ -33,16 +33,16 @@ pub fn open(path: PathBuf) -> OpenStream {
     })
 }
 
+fn open_direct(path: &Path) -> Option<(File, PathBuf)> {
+    let used = direct(path);
+    Some((File::open(&used).ok()?, used))
+}
+
 /// The drive itself rather than its FUSE view, where the system lets the
 /// app read it (`/storage/1234-ABCD/…` is `/mnt/media_rw/1234-ABCD/…`).
-fn open_direct(path: &Path) -> Option<(File, PathBuf)> {
-    let direct = path.strip_prefix("/storage").ok().filter(|rest| !rest.starts_with("emulated") && !rest.starts_with("self"));
-    if let Some(direct) = direct.map(|rest| Path::new("/mnt/media_rw").join(rest)) {
-        if let Ok(f) = File::open(&direct) {
-            return Some((f, direct));
-        }
-    }
-    Some((File::open(path).ok()?, path.to_owned()))
+pub fn direct(path: &Path) -> PathBuf {
+    let rest = path.strip_prefix("/storage").ok().filter(|rest| !rest.starts_with("emulated") && !rest.starts_with("self"));
+    rest.map(|rest| Path::new("/mnt/media_rw").join(rest)).filter(|d| File::open(d).is_ok()).unwrap_or_else(|| path.to_owned())
 }
 
 /// Subtitle files next to `path` named like it, which libVLC can't look for

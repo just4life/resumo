@@ -124,10 +124,23 @@ pub struct PlayerApp {
     android: AndroidState,
 }
 
+/// Where the search for black bars in the current video is (see `barprobe`).
+#[cfg(target_os = "android")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarSearch {
+    NotYet,
+    Running,
+    Done,
+    /// The video couldn't be opened a second time, or showed too few pictures.
+    Failed,
+}
+
 /// Touch-screen and file-browser state that only the Android build has.
 #[cfg(target_os = "android")]
 struct AndroidState {
     browser: Option<Browser>,
+    /// The browser a video was started from, to go back to with "Назад".
+    browser_behind: Option<Browser>,
     /// Folder the browser was last in, to reopen it there.
     last_dir: Option<PathBuf>,
     storage_ok: bool,
@@ -157,9 +170,13 @@ struct AndroidState {
     pip_sent: Option<(Option<(i32, i32)>, bool, bool)>,
     /// The last few files played, offered on the empty screen and in the open menu.
     history: History,
-    /// How the picture fills the screen, and whether black bars in the video are cut.
+    /// How the picture fills the screen.
     view: ViewSettings,
+    /// Black bars in the picture itself, cut unless it is shown whole.
     bars: BarFinder,
+    /// Looks for them when the app doesn't get the pixels (see `barprobe`).
+    probe: Option<crate::barprobe::BarProbe>,
+    bar_search: BarSearch,
     /// Remote control: what has the focus on each screen.
     tv: tv_app::TvState,
     /// The decoder's own output, when the GPU path could be set up.
@@ -308,6 +325,7 @@ impl PlayerApp {
             #[cfg(target_os = "android")]
             android: AndroidState {
                 browser: None,
+                browser_behind: None,
                 last_dir: None,
                 storage_ok: platform::has_storage_access(),
                 storage_checked: Instant::now(),
@@ -327,6 +345,8 @@ impl PlayerApp {
                 history: History::load(),
                 view,
                 bars: BarFinder::default(),
+                probe: None,
+                bar_search: BarSearch::NotYet,
                 tv: tv_app::TvState::default(),
                 gpu,
                 gpu_picture: None,
@@ -394,7 +414,11 @@ impl PlayerApp {
         self.playlist.current = Some(index);
         self.selected = Some(index);
         #[cfg(target_os = "android")]
-        self.android.bars.reset();
+        {
+            self.android.bars.reset();
+            self.android.probe = None;
+            self.android.bar_search = BarSearch::NotYet;
+        }
         self.subtitle_delay_ms = 0;
         self.audio_delay_ms = 0;
         self.seek_drag = None;
@@ -452,6 +476,13 @@ impl PlayerApp {
         self.events.reset();
         self.sink.clear();
         self.playlist.current = None;
+        #[cfg(target_os = "android")]
+        {
+            self.android.probe = None;
+            // The next film starts whole; P+ and the playlist keep the zoom
+            // for the rest of a series, since they don't stop.
+            self.android.view.zoom = Zoom::Fit;
+        }
     }
 
     fn next(&mut self, auto: bool) {
@@ -682,12 +713,19 @@ impl PlayerApp {
         }
     }
 
+    /// Black bars drawn into the video are left alone only when it is shown
+    /// whole; filling the screen means filling it with the picture.
+    #[cfg(target_os = "android")]
+    fn cuts_bars(&self) -> bool {
+        self.android.view.zoom != Zoom::Fit
+    }
+
     /// The part of the frame on screen: without the black bars found in the
-    /// video (when that is on), then cropped as chosen.
+    /// video (see [`Self::cuts_bars`]), then cropped as chosen.
     #[cfg(target_os = "android")]
     fn picture_uv(&self) -> Rect {
         let (w, h) = self.frame_size;
-        let bars = if self.android.view.cut_bars { self.android.bars.content() } else { Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)) };
+        let bars = if self.cuts_bars() { self.android.bars.content() } else { Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)) };
         let inner = self.crop.uv_rect(w * bars.width(), h * bars.height());
         Rect::from_min_max(bars.min + inner.min.to_vec2() * bars.size(), bars.min + inner.max.to_vec2() * bars.size())
     }
@@ -703,10 +741,42 @@ impl PlayerApp {
         )
     }
 
+    /// Looks for black bars drawn into the current video, whose pixels the
+    /// video layer and the GPU path keep from the app, from where it is now.
+    #[cfg(target_os = "android")]
+    fn start_bar_probe(&mut self, ctx: &egui::Context) {
+        self.android.bar_search = BarSearch::Failed;
+        let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get(i)) else { return };
+        let options = lan::media_options(&item.location);
+        // A USB drive is read directly, like the video being watched.
+        let location = if item.location.contains("://") {
+            item.location.clone()
+        } else {
+            crate::readahead::direct(std::path::Path::new(&item.location)).to_string_lossy().into_owned()
+        };
+        let ctx = ctx.clone();
+        let repaint = move || ctx.request_repaint();
+        self.android.probe = crate::barprobe::BarProbe::start(&self._instance, &location, &options, self.player.time(), repaint);
+        if self.android.probe.is_some() {
+            self.android.bar_search = BarSearch::Running;
+        }
+    }
+
+    /// Looks for bars in the current video again, from where it is now; the
+    /// bars found so far stay cut until then.
+    #[cfg(target_os = "android")]
+    fn search_bars_again(&mut self) {
+        self.android.probe = None;
+        self.android.bar_search = BarSearch::NotYet;
+    }
+
     #[cfg(target_os = "android")]
     fn set_zoom(&mut self, zoom: Zoom) {
+        // Bars are looked for again whenever cutting is turned on.
+        if zoom != Zoom::Fit && !self.cuts_bars() && self.texture.is_none() {
+            self.search_bars_again();
+        }
         self.android.view.zoom = zoom;
-        self.android.view.save();
         self.notify(format!("Масштаб: {}", zoom.label()));
     }
 
@@ -866,8 +936,29 @@ impl PlayerApp {
                 platform::set_keep_screen_on(playing);
             }
             self.android.guard.tick(playing && self.shows_picture());
-            if self.android.view.cut_bars && self.texture.is_some() {
-                self.android.bars.update(&self.sink);
+            if self.cuts_bars() {
+                if self.texture.is_some() {
+                    // The CPU path has every picture to look at.
+                    self.android.bars.update(&self.sink);
+                } else if self.android.gpu.is_some() && self.android.bar_search == BarSearch::NotYet && playing && self.shows_picture() {
+                    self.start_bar_probe(ctx);
+                }
+            }
+            // Two places that agree are cut right away; the rest only refine it.
+            if let Some(early) = self.android.probe.as_ref().and_then(|p| p.so_far()) {
+                if early != self.android.bars.content() {
+                    self.android.bars.set(early);
+                }
+            }
+            if let Some(found) = self.android.probe.as_mut().and_then(|p| p.poll()) {
+                self.android.probe = None;
+                self.android.bar_search = match found {
+                    Some(content) => {
+                        self.android.bars.set(content);
+                        BarSearch::Done
+                    }
+                    None => BarSearch::Failed,
+                };
             }
             // Going Home with a video playing turns it into a small window,
             // whose button shows pause or play.
@@ -945,6 +1036,8 @@ impl PlayerApp {
         if pressed(Key::S) {
             self.cycle_subtitles();
         }
+        // The TV has no cropping: its picture fills the screen or not.
+        #[cfg(not(target_os = "android"))]
         if pressed(Key::C) {
             self.cycle_crop();
         }
@@ -1181,7 +1274,7 @@ impl PlayerApp {
         #[cfg(not(target_os = "android"))]
         let cropped = self.crop != Crop::None;
         #[cfg(target_os = "android")]
-        let cropped = self.crop != Crop::None || self.android.view.zoom != Zoom::Fit || self.android.view.cut_bars;
+        let cropped = self.crop != Crop::None || self.android.view.zoom != Zoom::Fit;
         theme::menu_icon(ui, Icon::Crop, "Кадрирование (C)", cropped, |ui| self.crop_menu(ui));
         theme::menu_icon(ui, Icon::Subtitles, "Субтитры (S)", false, |ui| self.subtitle_menu(ui));
         theme::menu_icon(ui, Icon::Audio, "Аудиодорожка (A)", false, |ui| self.audio_menu(ui));
@@ -1301,13 +1394,6 @@ impl PlayerApp {
                     }
                 }
             });
-            let mut cut = self.android.view.cut_bars;
-            if ui.checkbox(&mut cut, "Убирать чёрные полосы в самом видео").changed() {
-                self.android.view.cut_bars = cut;
-                self.android.view.save();
-                self.android.bars.reset();
-                self.notify(if cut { "Чёрные полосы убираются" } else { "Чёрные полосы не убираются" });
-            }
             ui.separator();
         }
         ui.label(RichText::new("Кадрирование").strong());

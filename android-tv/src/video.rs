@@ -30,6 +30,8 @@ pub struct VideoSink {
     layout: UnsafeCell<Layout>,
     front: Mutex<Frame>,
     repaint: Box<dyn Fn() + Send + Sync>,
+    /// Wider pictures are scaled down to this width (0: as decoded).
+    max_width: usize,
 }
 
 // SAFETY: `back` and `layout` are only accessed from libVLC's (single) video
@@ -48,7 +50,15 @@ impl VideoSink {
             layout: UnsafeCell::new(Layout { width: 0, height: 0, pitch: 0 }),
             front: Mutex::new(Frame::default()),
             repaint: Box::new(repaint),
+            max_width: 0,
         }
+    }
+
+    /// Has libVLC scale pictures wider than `width` down to it.
+    #[cfg(target_os = "android")]
+    pub fn shrunk_to(mut self, width: usize) -> Self {
+        self.max_width = width;
+        self
     }
 
     /// Runs `f` with the current frame.
@@ -88,10 +98,16 @@ unsafe extern "C" fn format_cb(
 ) -> c_uint {
     let sink = &*(*opaque as *const VideoSink);
     std::ptr::copy_nonoverlapping(b"RGBA".as_ptr() as *const c_char, chroma, 4);
-    let w = *width as usize;
-    let h = *height as usize;
+    let mut w = *width as usize;
+    let mut h = *height as usize;
     if w == 0 || h == 0 {
         return 0;
+    }
+    if sink.max_width > 0 && w > sink.max_width {
+        h = (h * sink.max_width / w).max(2);
+        w = sink.max_width;
+        *width = w as c_uint;
+        *height = h as c_uint;
     }
     // VLC's converters like 32-byte aligned rows and a few spare lines.
     let pitch = align(w * 4, 32);

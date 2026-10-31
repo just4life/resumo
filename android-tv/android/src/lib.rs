@@ -16,6 +16,7 @@ mod history;
 mod lan;
 mod platform;
 mod readahead;
+mod barprobe;
 mod surface;
 #[path = "../../src/osk.rs"]
 mod osk;

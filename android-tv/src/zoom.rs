@@ -1,8 +1,8 @@
 //! How the picture fills the video area (Android): whole, filling the
 //! screen, by width or by height, plus cutting off black bars that are part
 //! of the video itself (a film letterboxed into a 16:9 or 4:3 frame), found
-//! by looking at the frames. The choice is kept in `zoom.txt` in the app's
-//! private folder.
+//! by looking at the frames. The zoom is chosen per film; the HDR and video
+//! output choices are kept in `zoom.txt` in the app's private folder.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -28,15 +28,6 @@ impl Zoom {
 
     pub fn label(self) -> &'static str {
         Self::ALL.iter().find(|(z, _)| *z == self).map_or("", |(_, n)| n)
-    }
-
-    fn key(self) -> &'static str {
-        match self {
-            Zoom::Fit => "fit",
-            Zoom::Fill => "fill",
-            Zoom::Width => "width",
-            Zoom::Height => "height",
-        }
     }
 
     /// Where a picture with `aspect` (w/h) goes, centred on `area`. It can be
@@ -83,9 +74,8 @@ impl Output {
 }
 
 pub struct ViewSettings {
+    /// Chosen per film: not kept (see `App::stop`).
     pub zoom: Zoom,
-    /// Cut off black bars found in the video.
-    pub cut_bars: bool,
     /// Turn HDR video into SDR: `None` decides from the video.
     pub hdr_to_sdr: Option<bool>,
     pub output: Output,
@@ -95,14 +85,10 @@ pub struct ViewSettings {
 impl ViewSettings {
     pub fn load() -> Self {
         let dir = store::config_dir();
-        let mut s = Self { zoom: Zoom::Fit, cut_bars: false, hdr_to_sdr: None, output: Output::Layer, dir };
+        let mut s = Self { zoom: Zoom::Fit, hdr_to_sdr: None, output: Output::Layer, dir };
         let text = s.dir.as_ref().and_then(|d| std::fs::read_to_string(d.join("zoom.txt")).ok()).unwrap_or_default();
         for line in text.lines() {
             match line.split_once('=') {
-                Some(("zoom", v)) => {
-                    s.zoom = Zoom::ALL.iter().map(|(z, _)| *z).find(|z| z.key() == v).unwrap_or(Zoom::Fit)
-                }
-                Some(("cut_bars", v)) => s.cut_bars = v == "1",
                 Some(("hdr", v)) => s.hdr_to_sdr = match v { "on" => Some(true), "off" => Some(false), _ => None },
                 // `output=`, the older choice of two, is left behind: every
                 // TV starts again on the video layer.
@@ -122,7 +108,7 @@ impl ViewSettings {
             None => "auto",
         };
         let output = self.output.key();
-        let text = format!("zoom={}\ncut_bars={}\nhdr={hdr}\nvideo_out={output}\n", self.zoom.key(), self.cut_bars as u8);
+        let text = format!("hdr={hdr}\nvideo_out={output}\n");
         let _ = std::fs::write(dir.join("zoom.txt"), text);
     }
 }
@@ -218,6 +204,12 @@ impl BarFinder {
     /// Starts over, for a new video.
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// Takes bars found some other way (see `barprobe`).
+    pub fn set(&mut self, found: Rect) {
+        self.found = found;
+        self.candidate = None;
     }
 
     /// Looks at the newest frame now and then (while paused, the same frame

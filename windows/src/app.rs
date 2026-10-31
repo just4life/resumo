@@ -39,6 +39,11 @@ const HDR_BRIGHTNESS: std::ops::RangeInclusive<i32> = 50..=150;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 /// How often the info overlay re-reads the bitrate.
 const INFO_REFRESH: Duration = Duration::from_secs(1);
+/// Holding the mouse button on the video this long plays it at `HOLD_RATE`.
+const HOLD_DELAY: f64 = 0.35;
+const HOLD_RATE: f32 = 2.0;
+/// Moving further than this (points) while holding moves the window instead.
+const HOLD_SLOP: f32 = 6.0;
 /// Smallest window, in points (also set on the viewport in `main`).
 pub const MIN_WINDOW: egui::Vec2 = vec2(640.0, 380.0);
 
@@ -152,6 +157,11 @@ pub struct PlayerApp {
     fit_pending: bool,
     /// Where the video was drawn last frame.
     video_rect: Rect,
+    window_title: String,
+    /// Playing at `HOLD_RATE` while the mouse button is held on the video.
+    boosting: bool,
+    /// The current press on the video turned into moving the window.
+    hold_dragged: bool,
 }
 
 impl PlayerApp {
@@ -230,6 +240,9 @@ impl PlayerApp {
             tab_pressed: false,
             fit_pending: false,
             video_rect: Rect::NOTHING,
+            window_title: String::new(),
+            boosting: false,
+            hold_dragged: false,
         };
         app.add_paths(files, true);
         Ok(app)
@@ -681,7 +694,11 @@ impl PlayerApp {
             Some(t) => format!("{t} — Resumo"),
             None => "Resumo".to_owned(),
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        // Only on change: on Windows every title update repaints the window frame.
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
     }
 
     fn current_title(&self) -> Option<String> {
@@ -768,6 +785,55 @@ impl PlayerApp {
         if std::mem::take(&mut self.tab_pressed) {
             self.toggle_info();
         }
+    }
+
+    /// Press and hold on the video: faster playback while held, as on YouTube.
+    /// Press and move: drag the window, the video doubling as its handle.
+    fn hold_on_video(&mut self, ctx: &egui::Context, resp: &egui::Response) {
+        let held = resp.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_down());
+        if !held {
+            if self.boosting {
+                self.boosting = false;
+                self.player.set_rate(self.rate);
+            }
+            self.hold_dragged = false;
+            return;
+        }
+        if self.boosting || self.hold_dragged {
+            return;
+        }
+        let (origin, pos, start, now) =
+            ctx.input(|i| (i.pointer.press_origin(), i.pointer.interact_pos(), i.pointer.press_start_time(), i.time));
+        let moved = origin.zip(pos).is_some_and(|(o, p)| o.distance(p) > HOLD_SLOP);
+        if moved {
+            self.hold_dragged = true;
+            if !self.fullscreen {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+        } else if start.is_some_and(|t| now - t >= HOLD_DELAY) {
+            if self.player.is_playing() && self.has_picture() {
+                self.boosting = true;
+                self.player.set_rate(HOLD_RATE);
+            } else {
+                // Paused or nothing shown: nothing to speed up.
+                self.hold_dragged = true;
+            }
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
+    }
+
+    /// "×2" at the top of the video while the hold speed-up is on.
+    fn boost_badge(&self, ui: &Ui, rect: Rect) {
+        if !self.boosting {
+            return;
+        }
+        let text = format!("Скорость {}×", trim_float(HOLD_RATE));
+        let galley = ui.painter().layout_no_wrap(text, FontId::proportional(16.0), Color32::WHITE);
+        let size = galley.size() + vec2(32.0, 14.0);
+        let pill = Rect::from_center_size(pos2(rect.center().x, rect.top() + 24.0 + size.y / 2.0), size);
+        ui.painter().rect_filled(pill, size.y / 2.0, Color32::from_black_alpha(170));
+        ui.painter().galley(pill.min + vec2(16.0, 7.0), galley, Color32::WHITE);
     }
 
     fn toggle_info(&mut self) {
@@ -1424,10 +1490,8 @@ impl PlayerApp {
             self.open_files_dialog(true);
         } else if resp.clicked() && over_play {
             self.toggle_pause();
-        } else if resp.drag_started_by(egui::PointerButton::Primary) && !self.fullscreen {
-            // The video doubles as a handle for moving the window.
-            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
         }
+        self.hold_on_video(ctx, &resp);
         resp.context_menu(|ui| {
             ui.set_min_width(200.0);
             ui.menu_button("Аудиодорожка", |ui| self.audio_menu(ui));
@@ -1472,6 +1536,7 @@ impl PlayerApp {
 
         self.overlay_controls(ui, ctx, rect);
         let info_bottom = self.info_overlay(ui, ctx, rect);
+        self.boost_badge(ui, rect);
 
         // Short on-screen message (track switched, crop changed, ...).
         if let Some((text, at)) = &self.status {
@@ -1623,6 +1688,12 @@ impl eframe::App for PlayerApp {
         }
         egui::CentralPanel::no_frame().show(ui, |ui| self.video_area(ui, &ctx));
         self.fit_window(frame, &ctx);
+        // While a video plays, draw at the screen's own rate rather than only
+        // on new frames and mouse moves: screens with variable refresh rate
+        // (G-Sync, FreeSync) visibly flicker when the frame rate keeps jumping.
+        if self.player.is_playing() {
+            ctx.request_repaint();
+        }
         self.url_window(&ctx);
         self.resize_edges(&ctx);
     }

@@ -78,11 +78,35 @@ enum Row {
     FileName,
     SaveHere,
     Entry(usize),
+    /// A server, share or address opened before, newest first.
+    Recent(usize),
     Address,
     Server(usize),
     NetEntry(usize),
-    /// A remembered network login; OK forgets it.
-    SavedLogin(usize),
+}
+
+/// What a held OK offers on a network row.
+enum MenuItem {
+    /// Takes the place off the recent ones.
+    ForgetPlace(String),
+    /// Forgets the login saved for the server.
+    ForgetLogin(String),
+}
+
+impl MenuItem {
+    fn label(&self) -> String {
+        match self {
+            MenuItem::ForgetPlace(_) => "Убрать из списка".into(),
+            MenuItem::ForgetLogin(server) => format!("Забыть пароль для {server}"),
+        }
+    }
+}
+
+/// The menu a held OK opens, over the list.
+struct RowMenu {
+    title: String,
+    items: Vec<MenuItem>,
+    focus: usize,
 }
 
 pub struct Browser {
@@ -102,6 +126,7 @@ pub struct Browser {
     sources: ListNav,
     list: ListNav,
     editing: Option<(Editing, String)>,
+    menu: Option<RowMenu>,
     /// Rows that fit on screen, from the last frame.
     visible_rows: usize,
 }
@@ -119,8 +144,10 @@ struct NetView {
     loaded_at: Option<Instant>,
     polled_at: Instant,
     servers: Vec<NetItem>,
-    /// Servers a login is remembered for (`lan::saved_logins`).
-    logins: Vec<String>,
+    /// Opened before (`lan::recent_places`).
+    recent: Vec<NetItem>,
+    /// The place opened from the top is in `recent` now that it listed.
+    remembered: bool,
     address: String,
     /// After going up: the folder we came from, to put the focus back on it.
     came_from: Option<String>,
@@ -147,13 +174,15 @@ impl NetView {
             loaded_at: None,
             polled_at: Instant::now(),
             servers,
-            logins: lan::saved_logins(),
+            recent: lan::recent_places(),
+            remembered: false,
             address: "smb://".to_owned(),
             came_from: None,
         }
     }
 
     fn open(&mut self, item: NetItem) {
+        self.remembered = self.remembered && !self.stack.is_empty();
         self.stack.push(item);
         self.came_from = None;
         self.load();
@@ -187,7 +216,6 @@ impl NetView {
         self.polled_at = Instant::now();
         let Some(listing) = &self.listing else {
             self.servers = self.lan.servers();
-            self.logins = lan::saved_logins();
             return;
         };
         if self.loaded_at.is_some_and(|t| t.elapsed() > Duration::from_secs(5)) {
@@ -201,6 +229,12 @@ impl NetView {
                 self.items = items;
                 self.state = NetState::Ready;
                 self.loaded_at.get_or_insert_with(Instant::now);
+                // It opens: next time it is first in the list.
+                if let (false, [place]) = (self.remembered, self.stack.as_slice()) {
+                    lan::remember_place(place);
+                    self.recent = lan::recent_places();
+                    self.remembered = true;
+                }
             }
             ListState::Failed => {
                 if self.state == NetState::Loading {
@@ -235,6 +269,7 @@ impl Browser {
             sources: ListNav::default(),
             list: ListNav::default(),
             editing: None,
+            menu: None,
             visible_rows: 8,
         };
         b.enter(dir);
@@ -378,13 +413,34 @@ impl Browser {
             .collect()
     }
 
+    /// The row of the folder or file at `location` (a path, or a network
+    /// address as the playlist keeps it), if it is listed.
+    fn row_at(&self, location: &str, has_access: bool) -> Option<usize> {
+        self.rows(has_access).iter().position(|r| match (*r, &self.net) {
+            (Row::Entry(i), _) => self.entries[i].path.to_string_lossy() == location,
+            (Row::Recent(i), Some(net)) => lan::same_place(&net.recent[i].mrl, location),
+            (Row::Server(i), Some(net)) => lan::same_place(&net.servers[i].mrl, location),
+            (Row::NetEntry(i), Some(net)) => net.items[i].mrl.trim() == location,
+            _ => false,
+        })
+    }
+
+    /// Back from the video at `location`: the focus on it, if it is here.
+    pub fn focus_on(&mut self, location: &str, has_access: bool) {
+        if let Some(i) = self.row_at(location, has_access) {
+            self.zone = Zone::List;
+            self.list.focus = i;
+        }
+    }
+
     fn rows(&self, has_access: bool) -> Vec<Row> {
         let mut rows = Vec::new();
         if let Some(net) = &self.net {
             if net.stack.is_empty() {
+                rows.extend((0..net.recent.len()).map(Row::Recent));
                 rows.push(Row::Address);
-                rows.extend((0..net.servers.len()).map(Row::Server));
-                rows.extend((0..net.logins.len()).map(Row::SavedLogin));
+                let new = |i: &usize| !net.recent.iter().any(|r| lan::same_place(&r.mrl, &net.servers[*i].mrl));
+                rows.extend((0..net.servers.len()).filter(new).map(Row::Server));
             } else {
                 if net.items.iter().any(|i| !i.is_dir) {
                     rows.push(Row::WholeFolder);
@@ -415,6 +471,10 @@ impl Browser {
             if press.nav == Nav::Back {
                 self.editing = None;
             }
+            return Action::None;
+        }
+        if self.menu.is_some() {
+            self.handle_menu(press);
             return Action::None;
         }
         match self.zone {
@@ -478,12 +538,62 @@ impl Browser {
                     return Action::Close;
                 }
             }
+            Nav::Ok if press.long && self.open_menu(rows.get(self.list.focus).copied()) => {}
             Nav::Ok => return rows.get(self.list.focus).map_or(Action::None, |r| self.activate(*r, false)),
             // Menu on a video adds it to the playlist without leaving.
             Nav::Menu => return rows.get(self.list.focus).map_or(Action::None, |r| self.activate(*r, true)),
             _ => {}
         }
         Action::None
+    }
+
+    /// What a held OK offers on `row`, with a title for the menu.
+    fn menu_for(&self, row: Option<Row>) -> Option<(String, Vec<MenuItem>)> {
+        let net = self.net.as_ref()?;
+        let (title, mrl, recent) = match row? {
+            Row::Recent(i) => (&net.recent[i].name, &net.recent[i].mrl, true),
+            Row::Server(i) => (&net.servers[i].name, &net.servers[i].mrl, false),
+            _ => return None,
+        };
+        let mut items = Vec::new();
+        if recent {
+            items.push(MenuItem::ForgetPlace(mrl.clone()));
+        }
+        if let Some(server) = lan::login_saved_for(mrl) {
+            items.push(MenuItem::ForgetLogin(server));
+        }
+        (!items.is_empty()).then(|| (title.clone(), items))
+    }
+
+    /// Opens the held row's menu; false when it has none.
+    fn open_menu(&mut self, row: Option<Row>) -> bool {
+        let Some((title, items)) = self.menu_for(row) else { return false };
+        self.menu = Some(RowMenu { title, items, focus: 0 });
+        true
+    }
+
+    fn handle_menu(&mut self, press: Press) {
+        let Some(menu) = &mut self.menu else { return };
+        let n = menu.items.len();
+        match press.nav {
+            Nav::Up => menu.focus = menu.focus.saturating_sub(1),
+            Nav::Down => menu.focus = (menu.focus + 1).min(n - 1),
+            Nav::Back | Nav::Left => self.menu = None,
+            Nav::Ok => {
+                let item = self.menu.take().map(|m| m.items.into_iter().nth(m.focus));
+                match item.flatten() {
+                    Some(MenuItem::ForgetPlace(mrl)) => {
+                        lan::forget_place(&mrl);
+                        if let Some(net) = &mut self.net {
+                            net.recent = lan::recent_places();
+                        }
+                    }
+                    Some(MenuItem::ForgetLogin(server)) => lan::forget_login(&server),
+                    None => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     fn activate(&mut self, row: Row, add_only: bool) -> Action {
@@ -540,20 +650,20 @@ impl Browser {
                     }
                 };
             }
+            Row::Recent(i) => {
+                if let Some(net) = &mut self.net {
+                    if let Some(s) = net.recent.get(i).cloned() {
+                        net.open(s);
+                        self.list = ListNav::default();
+                    }
+                }
+            }
             Row::Server(i) => {
                 if let Some(net) = &mut self.net {
                     if let Some(s) = net.servers.get(i).cloned() {
                         net.open(s);
                         self.list = ListNav::default();
                     }
-                }
-            }
-            Row::SavedLogin(i) => {
-                if let Some(net) = &mut self.net {
-                    if let Some(server) = net.logins.get(i) {
-                        lan::forget_login(server);
-                    }
-                    net.logins = lan::saved_logins();
                 }
             }
             Row::NetEntry(i) => {
@@ -577,23 +687,17 @@ impl Browser {
 
     /// Draws the browser over `rect`; `store` says which videos were seen.
     pub fn show(&mut self, ui: &mut Ui, rect: Rect, has_access: bool, store: &Store) {
+        let mut came_from = None;
         if let Some(net) = &mut self.net {
             net.tick();
             ui.ctx().request_repaint_after(NET_REPOLL);
-            // Back on the folder we came from, once the list has loaded.
             if net.state == NetState::Ready {
-                if let Some(mrl) = net.came_from.take() {
-                    let at = if net.stack.is_empty() {
-                        net.servers.iter().position(|s| s.mrl == mrl).map(|i| i + 1)
-                    } else {
-                        let whole = usize::from(net.items.iter().any(|i| !i.is_dir));
-                        net.items.iter().position(|s| s.mrl == mrl).map(|i| i + whole)
-                    };
-                    if let Some(i) = at {
-                        self.list.focus = i;
-                    }
-                }
+                came_from = net.came_from.take();
             }
+        }
+        // Back on the folder we came from, once the list has loaded.
+        if let Some(i) = came_from.and_then(|mrl| self.row_at(&mrl, has_access)) {
+            self.list.focus = i;
         }
         let p = ui.painter().clone();
         p.rect_filled(rect, 0.0, theme::BG);
@@ -652,7 +756,28 @@ impl Browser {
             p.galley(pos2(x, below), g, theme::TEXT_DIM);
         }
 
+        if let Some(menu) = &self.menu {
+            p.rect_filled(rect, 0.0, Color32::from_black_alpha(150));
+            let w = 520.0;
+            let h = 56.0 + menu.items.len() as f32 * step;
+            let r = Rect::from_center_size(rect.center(), vec2(w, h));
+            p.rect_filled(r, 12.0, theme::SURFACE);
+            p.rect_stroke(r, 12.0, egui::Stroke::new(1.0, theme::BORDER), egui::StrokeKind::Inside);
+            let mut job = egui::text::LayoutJob::simple(menu.title.clone(), FontId::proportional(18.0), theme::TEXT, w - 48.0);
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            p.galley(r.min + vec2(24.0, 16.0), p.layout_job(job), theme::TEXT);
+            for (i, item) in menu.items.iter().enumerate() {
+                let row = Rect::from_min_size(r.min + vec2(16.0, 48.0 + i as f32 * step), vec2(w - 32.0, tv::ROW_H));
+                tv::row(&p, row, None, &item.label(), Trail::None, menu.focus == i, false);
+            }
+            tv::hint(&p, rect, "OK — выбрать     Назад — закрыть");
+            self.text_window(ui.ctx());
+            return;
+        }
+        let held = self.zone == Zone::List && self.menu_for(rows.get(self.list.focus).copied()).is_some();
         let hint = match (self.zone, self.purpose) {
+            _ if held => "OK — открыть     Держать OK — меню     Влево — источники     Назад — вверх",
             (Zone::Sources, _) => "OK — открыть     Вправо — к списку     Назад — закрыть",
             (Zone::List, Purpose::Open { play: true }) => {
                 "OK — смотреть     Меню — добавить в плейлист     Влево — источники     Назад — вверх"
@@ -690,6 +815,11 @@ impl Browser {
                     tv::seen_row(p, r, Some(icon), &e.name, store.seen(&e.path.to_string_lossy()), focused)
                 }
             }
+            Row::Recent(i) => {
+                let Some(net) = &self.net else { return };
+                let place = &net.recent[i];
+                tv::row(p, r, Some((Icon::Network, theme::ACCENT)), &place.name, Trail::Text(&place.mrl), focused, false)
+            }
             Row::Address => tv::row(
                 p,
                 r,
@@ -702,11 +832,6 @@ impl Browser {
             Row::Server(i) => {
                 let Some(net) = &self.net else { return };
                 tv::row(p, r, Some((Icon::Network, theme::ACCENT)), &net.servers[i].name, Trail::None, focused, false)
-            }
-            Row::SavedLogin(i) => {
-                let Some(net) = &self.net else { return };
-                let label = format!("Пароль для {}", net.logins[i]);
-                tv::row(p, r, Some((Icon::Close, theme::TEXT_DIM)), &label, Trail::Text("OK — забыть"), focused, false)
             }
             Row::NetEntry(i) => {
                 let Some(net) = &self.net else { return };
