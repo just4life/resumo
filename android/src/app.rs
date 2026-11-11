@@ -111,6 +111,10 @@ pub struct PlayerApp {
     wheel_acc: f32,
     icon: Option<TextureHandle>,
     thumb_bar: ThumbBar,
+    /// The window title last sent: every viewport command makes egui draw
+    /// another frame, so sending it each frame kept the app redrawing
+    /// nonstop even with nothing on screen changing.
+    window_title: String,
     #[cfg(target_os = "android")]
     android: AndroidState,
 }
@@ -134,6 +138,14 @@ struct AndroidState {
     /// Whether the Wi-Fi multicast lock is held (for network discovery).
     multicast: bool,
     swipe: Option<Swipe>,
+    /// Two fingers on the video: how far they have spread (1 = as they
+    /// started), until the pinch has done its job or they lift.
+    pinch: Option<f32>,
+    /// A pinch happened during this touch: lifting the fingers isn't a tap.
+    pinched: bool,
+    /// Whether black bars were being cut before a pinch out turned it on,
+    /// so pinching back in restores it.
+    cut_before_pinch: Option<bool>,
     /// Whether the control bar was showing when the finger went down (any
     /// touch shows it, so later frames can't tell).
     controls_at_press: bool,
@@ -163,6 +175,13 @@ struct AndroidState {
     gpu_serial: u64,
     /// When to close the app after the video output was switched.
     exit_at: Option<Instant>,
+    /// What the lock screen was last told: (title, playing, length, rate).
+    media_sent: Option<(Option<String>, bool, Option<i64>, u32)>,
+    /// Position last told, and when.
+    media_pos: (i64, Instant),
+    /// The video track turned off while the screen is locked (only the
+    /// sound plays then), to turn back on.
+    video_off: Option<i32>,
 }
 
 /// A finger sliding over the video: up and down on the left half sets the
@@ -188,6 +207,14 @@ enum SwipeKind {
     Volume,
     Seek,
 }
+
+/// The app, for the thread that runs it while hidden (see
+/// `PlayerApp::background_lock`); 0 once it is gone.
+#[cfg(target_os = "android")]
+static APP_PTR: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+#[cfg(target_os = "android")]
+const DISABLE_VIDEO_WHEN_LOCKED: bool = false;
 
 /// How far a finger moves before a touch counts as a swipe.
 #[cfg(target_os = "android")]
@@ -295,6 +322,7 @@ impl PlayerApp {
             wheel_acc: 0.0,
             icon,
             thumb_bar: ThumbBar::default(),
+            window_title: String::new(),
             #[cfg(target_os = "android")]
             android: AndroidState {
                 browser: None,
@@ -308,6 +336,9 @@ impl PlayerApp {
                 lan_dialog: None,
                 multicast: false,
                 swipe: None,
+                pinch: None,
+                pinched: false,
+                cut_before_pinch: None,
                 controls_at_press: true,
                 touch_cancelled: false,
                 tap_paused: false,
@@ -324,6 +355,9 @@ impl PlayerApp {
                 hdr: None,
                 gpu_serial: 0,
                 exit_at: None,
+                media_sent: None,
+                media_pos: (0, Instant::now()),
+                video_off: None,
             },
         };
         app.add_paths(files, true);
@@ -354,7 +388,12 @@ impl PlayerApp {
         let options = lan::media_options(&location);
         #[cfg(not(target_os = "android"))]
         let options = Vec::new();
-        if let Err(e) = self.player.set_media(&location, &options) {
+        // A shared folder's server by its address (see `lan::by_address`).
+        #[cfg(target_os = "android")]
+        let opened = lan::by_address_waiting(&location);
+        #[cfg(not(target_os = "android"))]
+        let opened = location.clone();
+        if let Err(e) = self.player.set_media(&opened, &options) {
             self.notify(format!("Не удалось открыть: {e}"));
             return;
         }
@@ -367,6 +406,10 @@ impl PlayerApp {
         self.seek_drag = None;
         self.pending_subtitles.clear();
         self.resume_at = self.store.position(&location);
+        #[cfg(target_os = "android")]
+        if let Some(g) = &mut self.android.gpu {
+            g.ensure_attached();
+        }
         if !self.player.play() {
             self.notify("Не удалось начать воспроизведение");
         }
@@ -785,7 +828,17 @@ impl PlayerApp {
         let layer_size = gpu.picture_size().or(size.map(|(w, h)| (w as f32, h as f32)));
         self.android.layer_picture = layer && size.is_some();
         if shown.reattached {
-            self.player.restart_video();
+            // Turned off while locked: back on now that libVLC has somewhere
+            // to draw (on before that, it would set up a picture of its own).
+            match self.android.video_off.take() {
+                Some(id) => {
+                    self.player.set_video_track(id);
+                    if self.player.is_seekable() {
+                        self.player.set_time(self.player.time());
+                    }
+                }
+                None => self.player.restart_video(),
+            }
         }
         if let Some(s) = layer_size.filter(|_| self.android.layer_picture) {
             self.frame_size = s;
@@ -809,6 +862,10 @@ impl PlayerApp {
             } else {
                 ctx.request_repaint();
             }
+        } else {
+            // Opening or paused: the layer is still looked after (given back
+            // after the app was in the background).
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 
@@ -912,6 +969,199 @@ impl PlayerApp {
     // ------------------------------------------------------------ per frame
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_events();
+        let serial = self.sink.with_frame(|f| f.serial);
+        if serial != self.frame_serial {
+            self.frame_serial = serial;
+            let image = self.sink.with_frame(|f| {
+                (f.width > 0)
+                    .then(|| egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.pixels))
+            });
+            match image {
+                Some(img) => {
+                    self.frame_size = (img.size[0] as f32, img.size[1] as f32);
+                    match &mut self.texture {
+                        Some(t) if t.size() == img.size => t.set(img, TextureOptions::LINEAR),
+                        _ => self.texture = Some(ctx.load_texture("video", img, TextureOptions::LINEAR)),
+                    }
+                }
+                None => self.texture = None,
+            }
+        }
+
+        if self.is_active() {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        #[cfg(target_os = "android")]
+        {
+            let playing = self.player.is_playing();
+            if playing != self.android.keep_screen_on {
+                self.android.keep_screen_on = playing;
+                platform::set_keep_screen_on(playing);
+            }
+            self.android.guard.tick(playing && self.shows_picture());
+            self.media_actions();
+            self.publish_media();
+            // (With the decoder's own output, in `gpu_frame`.)
+            if self.android.view.cut_bars && self.texture.is_some() {
+                self.android.bars.update(&self.sink);
+            }
+            // Going Home with a video playing turns it into a small window,
+            // whose button shows pause or play.
+            let video = playing && self.shows_picture();
+            let aspect = if self.shows_picture() { self.pip_aspect() } else { None };
+            let pip = (aspect, video, playing);
+            if self.android.pip_sent != Some(pip) {
+                self.android.pip_sent = Some(pip);
+                platform::set_auto_pip(pip.0, pip.1, pip.2);
+            }
+            if self.android.pip_checked.elapsed() > Duration::from_millis(300) {
+                self.android.pip_checked = Instant::now();
+                platform::refresh_insets();
+                // A press is read (and dropped) even out of the small window,
+                // so a late one can't pause the video the next time.
+                let pressed = platform::pip_button_pressed();
+                self.android.pip = platform::in_pip();
+                if self.android.pip && pressed {
+                    self.toggle_pause();
+                }
+            }
+        }
+        let title = match self.current_title() {
+            Some(t) => format!("{t} — Resumo"),
+            None => "Resumo".to_owned(),
+        };
+        if title != self.window_title {
+            self.window_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
+    }
+
+    /// Presses on the lock screen, in the notification or on headphones.
+    #[cfg(target_os = "android")]
+    fn media_actions(&mut self) {
+        use platform::MediaAction as A;
+        for action in platform::take_media_actions() {
+            match action {
+                A::Play if self.is_active() => self.player.set_pause(false),
+                A::Play | A::Toggle => self.toggle_pause(),
+                A::Pause | A::Stop => {
+                    if self.is_active() {
+                        self.player.set_pause(true);
+                        self.remember_position();
+                        self.store.save();
+                    }
+                }
+                A::Next => self.next(false),
+                A::Prev => self.prev(),
+                A::SeekTo(ms) => {
+                    if self.is_active() && self.player.is_seekable() {
+                        self.player.set_time(ms);
+                    }
+                }
+                A::SeekBy(d) => self.seek_by(d),
+            }
+            self.android.media_sent = None;
+        }
+    }
+
+    /// Tells the lock screen and the notification what is playing, when it
+    /// changed (the position only when it jumped).
+    #[cfg(target_os = "android")]
+    fn publish_media(&mut self) {
+        let title = self.current_title();
+        let playing = self.player.is_playing();
+        let length = self.player.length().filter(|&l| l > 0).filter(|_| title.is_some());
+        let pos = if title.is_some() { self.player.time().max(0) } else { 0 };
+        let key = (title.clone(), playing, length, self.rate.to_bits());
+        let (last, at) = self.android.media_pos;
+        let mut expected = if playing { last + (at.elapsed().as_millis() as f32 * self.rate) as i64 } else { last };
+        if let Some(l) = length {
+            expected = expected.min(l);
+        }
+        if self.android.media_sent.as_ref() == Some(&key) && (pos - expected).abs() < 2000 {
+            return;
+        }
+        let n = self.playlist.items.len();
+        let subtitle = match self.playlist.current {
+            Some(i) if n > 1 => format!("{} из {n} · Resumo", i + 1),
+            _ => "Resumo".to_owned(),
+        };
+        if playing {
+            platform::request_notifications();
+        }
+        platform::publish_playback(title.as_deref(), &subtitle, playing, pos, length, self.rate);
+        self.android.media_sent = Some(key);
+        self.android.media_pos = (pos, Instant::now());
+    }
+
+    /// What the app does while Android has taken its window away (screen
+    /// off or locked, the UI not running): presses from the lock screen,
+    /// going on to the next video, and only the sound while locked.
+    #[cfg(target_os = "android")]
+    fn background_tick(&mut self) {
+        self.media_actions();
+        self.poll_events();
+        if DISABLE_VIDEO_WHEN_LOCKED && self.player.is_playing() && platform::screen_locked() {
+            let id = self.player.video_track();
+            if id >= 0 {
+                self.player.set_video_track(-1);
+                self.android.video_off = Some(id);
+            }
+        }
+        self.publish_media();
+    }
+
+    /// Hands the app to the thread that runs [`Self::background_tick`] while
+    /// no frames come; held for the frame, so the two never overlap.
+    #[cfg(target_os = "android")]
+    fn background_lock(&mut self, ctx: &egui::Context) -> std::sync::MutexGuard<'static, usize> {
+        static LAST_FRAME_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        let epoch = *EPOCH.get_or_init(Instant::now);
+        let mut guard = APP_PTR.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = self as *mut Self as usize;
+        LAST_FRAME_MS.store(epoch.elapsed().as_millis() as u64, Ordering::SeqCst);
+        STARTED.call_once(|| {
+            let repaint = ctx.clone();
+            platform::on_media_action(move || repaint.request_repaint());
+            let _ = std::thread::Builder::new().name("background-tick".into()).spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(300));
+                let idle = (epoch.elapsed().as_millis() as u64).saturating_sub(LAST_FRAME_MS.load(Ordering::SeqCst));
+                if idle < 1000 {
+                    continue;
+                }
+                let guard = APP_PTR.lock().unwrap_or_else(|e| e.into_inner());
+                if *guard != 0 {
+                    // SAFETY: the app lives in eframe's box until `on_exit`
+                    // clears the pointer, and the UI thread only touches it
+                    // while holding this lock (a frame, `raw_input_hook`).
+                    unsafe { (*(*guard as *mut PlayerApp)).background_tick() };
+                }
+            });
+        });
+        guard
+    }
+
+    /// The picture comes back with the window (it was off while locked). In
+    /// the video layer that waits for the layer to be back (see `gpu_frame`).
+    #[cfg(target_os = "android")]
+    fn video_back(&mut self) {
+        if self.android.gpu.as_ref().is_some_and(|g| g.is_layer()) {
+            return;
+        }
+        if let Some(id) = self.android.video_off.take() {
+            self.player.set_video_track(id);
+            if self.player.is_seekable() {
+                self.player.set_time(self.player.time());
+            }
+        }
+    }
+
+    /// libVLC's news (started, failed, ended) and saving positions: also
+    /// run while the app is hidden (see `background_tick`).
+    fn poll_events(&mut self) {
         if self.events.playing.swap(false, Ordering::SeqCst) {
             // The audio output exists only once playback started.
             self.player.set_volume(self.volume);
@@ -954,67 +1204,6 @@ impl PlayerApp {
             }
             self.store.save();
         }
-
-        let serial = self.sink.with_frame(|f| f.serial);
-        if serial != self.frame_serial {
-            self.frame_serial = serial;
-            let image = self.sink.with_frame(|f| {
-                (f.width > 0)
-                    .then(|| egui::ColorImage::from_rgba_unmultiplied([f.width, f.height], &f.pixels))
-            });
-            match image {
-                Some(img) => {
-                    self.frame_size = (img.size[0] as f32, img.size[1] as f32);
-                    match &mut self.texture {
-                        Some(t) if t.size() == img.size => t.set(img, TextureOptions::LINEAR),
-                        _ => self.texture = Some(ctx.load_texture("video", img, TextureOptions::LINEAR)),
-                    }
-                }
-                None => self.texture = None,
-            }
-        }
-
-        if self.is_active() {
-            ctx.request_repaint_after(Duration::from_millis(250));
-        }
-        #[cfg(target_os = "android")]
-        {
-            let playing = self.player.is_playing();
-            if playing != self.android.keep_screen_on {
-                self.android.keep_screen_on = playing;
-                platform::set_keep_screen_on(playing);
-            }
-            self.android.guard.tick(playing && self.shows_picture());
-            // (With the decoder's own output, in `gpu_frame`.)
-            if self.android.view.cut_bars && self.texture.is_some() {
-                self.android.bars.update(&self.sink);
-            }
-            // Going Home with a video playing turns it into a small window,
-            // whose button shows pause or play.
-            let video = playing && self.shows_picture();
-            let aspect = if self.shows_picture() { self.pip_aspect() } else { None };
-            let pip = (aspect, video, playing);
-            if self.android.pip_sent != Some(pip) {
-                self.android.pip_sent = Some(pip);
-                platform::set_auto_pip(pip.0, pip.1, pip.2);
-            }
-            if self.android.pip_checked.elapsed() > Duration::from_millis(300) {
-                self.android.pip_checked = Instant::now();
-                platform::refresh_insets();
-                // A press is read (and dropped) even out of the small window,
-                // so a late one can't pause the video the next time.
-                let pressed = platform::pip_button_pressed();
-                self.android.pip = platform::in_pip();
-                if self.android.pip && pressed {
-                    self.toggle_pause();
-                }
-            }
-        }
-        let title = match self.current_title() {
-            Some(t) => format!("{t} — Resumo"),
-            None => "Resumo".to_owned(),
-        };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
 
     fn current_title(&self) -> Option<String> {
@@ -1890,27 +2079,34 @@ impl PlayerApp {
         }
         #[cfg(target_os = "android")]
         self.video_taps(ctx, &resp, rect);
-        resp.context_menu(|ui| {
-            ui.set_min_width(200.0);
-            ui.menu_button("Аудиодорожка", |ui| self.audio_menu(ui));
-            ui.menu_button("Субтитры", |ui| self.subtitle_menu(ui));
-            ui.menu_button("Кадрирование", |ui| self.crop_menu(ui));
-            ui.menu_button("Скорость", |ui| self.speed_menu(ui));
-            ui.menu_button("Аудиоустройство", |ui| self.audio_device_menu(ui));
-            ui.separator();
-            if ui.button("Открыть файлы…").clicked() {
-                ui.close();
-                self.open_files_dialog(true);
-            }
-            if ui.add_enabled(self.is_active(), egui::Button::new("Стоп")).clicked() {
-                ui.close();
-                self.stop();
-            }
-            if ui.button(if self.fullscreen { "Выйти из полного экрана" } else { "Полный экран" }).clicked() {
-                ui.close();
-                self.set_fullscreen(ctx, !self.fullscreen);
-            }
-        });
+        // Two fingers on the video are a pinch, not a long press.
+        #[cfg(target_os = "android")]
+        let menu = !self.android.pinched;
+        #[cfg(not(target_os = "android"))]
+        let menu = true;
+        if menu {
+            resp.context_menu(|ui| {
+                ui.set_min_width(200.0);
+                ui.menu_button("Аудиодорожка", |ui| self.audio_menu(ui));
+                ui.menu_button("Субтитры", |ui| self.subtitle_menu(ui));
+                ui.menu_button("Кадрирование", |ui| self.crop_menu(ui));
+                ui.menu_button("Скорость", |ui| self.speed_menu(ui));
+                ui.menu_button("Аудиоустройство", |ui| self.audio_device_menu(ui));
+                ui.separator();
+                if ui.button("Открыть файлы…").clicked() {
+                    ui.close();
+                    self.open_files_dialog(true);
+                }
+                if ui.add_enabled(self.is_active(), egui::Button::new("Стоп")).clicked() {
+                    ui.close();
+                    self.stop();
+                }
+                if ui.button(if self.fullscreen { "Выйти из полного экрана" } else { "Полный экран" }).clicked() {
+                    ui.close();
+                    self.set_fullscreen(ctx, !self.fullscreen);
+                }
+            });
+        }
 
         self.overlay_controls(ui, ctx, rect);
         #[cfg(target_os = "android")]
@@ -1941,6 +2137,9 @@ impl PlayerApp {
     /// right third seeks 10 s, in the middle it toggles fullscreen.
     #[cfg(target_os = "android")]
     fn video_taps(&mut self, ctx: &egui::Context, resp: &egui::Response, rect: Rect) {
+        if self.video_pinch(ctx) {
+            return;
+        }
         self.video_swipes(ctx, resp, rect);
         if !self.is_active() {
             if resp.clicked() {
@@ -1980,6 +2179,72 @@ impl PlayerApp {
         {
             self.android.hide_controls = true;
         }
+    }
+
+    /// Two fingers spreading apart fill the screen with the picture (black
+    /// bars in the video cut off); pinching them together shows it whole
+    /// again. True while a two-finger touch is going on (or its fingers are
+    /// still lifting), so the taps and swipes leave it alone.
+    #[cfg(target_os = "android")]
+    fn video_pinch(&mut self, ctx: &egui::Context) -> bool {
+        const OUT: f32 = 1.25;
+        const IN: f32 = 0.8;
+        let (touch, down) = ctx.input(|i| (i.multi_touch(), i.pointer.any_down() || i.any_touches()));
+        let Some(touch) = touch.filter(|t| t.num_touches >= 2) else {
+            self.android.pinch = None;
+            if self.android.pinched && !down {
+                self.android.pinched = false;
+                // The last finger is up now: the touch is over.
+                return true;
+            }
+            return self.android.pinched;
+        };
+        if !self.android.pinched {
+            self.android.pinched = true;
+            // A finger held still before the second one landed may have
+            // opened the long-press menu: a pinch closes it.
+            egui::Popup::close_all(ctx);
+            // A one-finger swipe that got going before the second finger
+            // came down is undone.
+            if let Some(sw) = self.android.swipe.take() {
+                match sw.kind {
+                    SwipeKind::Brightness => platform::set_brightness(sw.start),
+                    SwipeKind::Volume => self.set_volume(sw.start as i32),
+                    SwipeKind::Seek | SwipeKind::Undecided => {}
+                }
+            }
+            self.android.pinch = Some(1.0);
+        }
+        let Some(spread) = &mut self.android.pinch else { return true };
+        *spread *= touch.zoom_delta;
+        let spread = *spread;
+        if !self.is_active() {
+            return true;
+        }
+        if spread >= OUT {
+            self.android.pinch = None;
+            let view = &mut self.android.view;
+            if view.zoom != Zoom::Fill || !view.cut_bars {
+                if !view.cut_bars {
+                    self.android.cut_before_pinch = Some(false);
+                    view.cut_bars = true;
+                    self.android.bars.reset();
+                }
+                self.set_zoom(Zoom::Fill);
+            }
+        } else if spread <= IN {
+            self.android.pinch = None;
+            let view = &mut self.android.view;
+            let cut = self.android.cut_before_pinch.take().unwrap_or(false);
+            if view.zoom != Zoom::Fit || view.cut_bars != cut {
+                if view.cut_bars != cut {
+                    view.cut_bars = cut;
+                    self.android.bars.reset();
+                }
+                self.set_zoom(Zoom::Fit);
+            }
+        }
+        true
     }
 
     #[cfg(target_os = "android")]
@@ -2265,6 +2530,7 @@ impl eframe::App for PlayerApp {
     /// tap continues it. Treat a cancelled touch as the finger lifting.
     #[cfg(target_os = "android")]
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        let _bg = self.background_lock(ctx);
         let mut down = ctx.input(|i| i.pointer.any_down());
         let mut i = 0;
         while i < raw_input.events.len() {
@@ -2291,12 +2557,21 @@ impl eframe::App for PlayerApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(target_os = "android")]
+        {
+            *APP_PTR.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            platform::publish_playback(None, "", false, 0, None, 1.0);
+        }
         self.remember_position();
         self.store.save();
     }
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(target_os = "android")]
+        let _bg = self.background_lock(&ctx);
+        #[cfg(target_os = "android")]
+        self.video_back();
         self.poll(&ctx);
         self.handle_input(&ctx);
         let has_items = !self.playlist.items.is_empty();

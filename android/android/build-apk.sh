@@ -67,9 +67,16 @@ if [ ! -f "$vlc_dir/classes.dex" ]; then
 fi
 cp "$vlc_dir/classes.dex" "$stage/"
 
+# The app's own Java: the media session and the playback service (java/).
+javac_out="$work/java-classes"
+rm -rf "$javac_out" && mkdir -p "$javac_out"
+javac -nowarn -source 8 -target 8 -bootclasspath "$PLATFORM_JAR" -d "$javac_out" $(find java -name '*.java')
+"$BUILD_TOOLS/d8" --release --min-api "$API" --lib "$PLATFORM_JAR" --output "$javac_out" $(find "$javac_out" -name '*.class')
+cp "$javac_out/classes.dex" "$stage/classes2.dex"
+
 "$BUILD_TOOLS/aapt2" compile --dir res -o "$stage/res.zip"
 "$BUILD_TOOLS/aapt2" link -o "$stage/base.apk" -I "$PLATFORM_JAR" --manifest AndroidManifest.xml "$stage/res.zip"
-(cd "$stage" && zip -qr base.apk lib classes.dex)
+(cd "$stage" && zip -qr base.apk lib classes.dex classes2.dex)
 "$BUILD_TOOLS/zipalign" -f -p 4 "$stage/base.apk" "$stage/aligned.apk"
 
 # A fixed key, so a new APK installs over the previous one.

@@ -120,6 +120,10 @@ pub struct PlayerApp {
     wheel_acc: f32,
     icon: Option<TextureHandle>,
     thumb_bar: ThumbBar,
+    /// The window title last sent: every viewport command makes egui draw
+    /// another frame, so sending it each frame kept the app redrawing
+    /// nonstop even with nothing on screen changing.
+    window_title: String,
     #[cfg(target_os = "android")]
     android: AndroidState,
 }
@@ -322,6 +326,7 @@ impl PlayerApp {
             wheel_acc: 0.0,
             icon,
             thumb_bar: ThumbBar::default(),
+            window_title: String::new(),
             #[cfg(target_os = "android")]
             android: AndroidState {
                 browser: None,
@@ -403,7 +408,8 @@ impl PlayerApp {
             let subtitles = crate::readahead::subtitles_beside(&path);
             self.player.set_media_stream(crate::readahead::open(path), &options, &subtitles)
         } else {
-            self.player.set_media(&location, &options)
+            // A shared folder's server by its address (see `lan::by_address`).
+            self.player.set_media(&lan::by_address_waiting(&location), &options)
         };
         #[cfg(not(target_os = "android"))]
         let set = self.player.set_media(&location, &options);
@@ -424,6 +430,10 @@ impl PlayerApp {
         self.seek_drag = None;
         self.pending_subtitles.clear();
         self.resume_at = self.store.position(&location);
+        #[cfg(target_os = "android")]
+        if let Some(g) = &mut self.android.gpu {
+            g.ensure_attached();
+        }
         if !self.player.play() {
             self.notify("Не удалось начать воспроизведение");
         }
@@ -750,7 +760,7 @@ impl PlayerApp {
         let options = lan::media_options(&item.location);
         // A USB drive is read directly, like the video being watched.
         let location = if item.location.contains("://") {
-            item.location.clone()
+            lan::by_address(&item.location)
         } else {
             crate::readahead::direct(std::path::Path::new(&item.location)).to_string_lossy().into_owned()
         };
@@ -985,7 +995,10 @@ impl PlayerApp {
             Some(t) => format!("{t} — Resumo"),
             None => "Resumo".to_owned(),
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        if title != self.window_title {
+            self.window_title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
     }
 
     fn current_title(&self) -> Option<String> {

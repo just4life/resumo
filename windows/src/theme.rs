@@ -343,6 +343,16 @@ pub fn menu_icon(ui: &mut Ui, icon: Icon, tip: &str, on: bool, add: impl FnOnce(
     });
 }
 
+/// Like [`menu_icon`], but clicks inside the menu don't close it (for
+/// menus with − / + steppers). Call `ui.close()` to close it from inside.
+pub fn menu_icon_sticky(ui: &mut Ui, icon: Icon, tip: &str, on: bool, add: impl FnOnce(&mut Ui)) {
+    let resp = icon_button(ui, icon, tip, on);
+    egui::Popup::menu(&resp).close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
+        ui.set_min_width(230.0);
+        add(ui);
+    });
+}
+
 /// Text button that toggles a popup menu.
 pub fn menu_text(ui: &mut Ui, text: &str, tip: &str, add: impl FnOnce(&mut Ui)) {
     let resp = ui

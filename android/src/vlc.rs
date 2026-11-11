@@ -339,6 +339,20 @@ impl MediaPlayer {
         }
     }
 
+    /// The video track playing (-1: none).
+    #[cfg(target_os = "android")]
+    pub fn video_track(&self) -> i32 {
+        unsafe { libvlc_video_get_track(self.raw) }
+    }
+
+    /// Turns the picture off (-1) or back on, the sound going on regardless.
+    #[cfg(target_os = "android")]
+    pub fn set_video_track(&self, id: i32) {
+        unsafe {
+            libvlc_video_set_track(self.raw, id);
+        }
+    }
+
     /// The decoded picture's size, once the video is playing.
     #[cfg(target_os = "android")]
     pub fn video_size(&self) -> Option<(u32, u32)> {

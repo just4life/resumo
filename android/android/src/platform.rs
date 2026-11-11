@@ -1,8 +1,9 @@
 //! The few things the player needs from Android itself, reached through JNI
 //! from Rust: storage permission, screen brightness and orientation,
 //! picture-in-picture (with its pause/play button), the clipboard, the intent the app was opened with,
-//! Wi-Fi multicast for network discovery, and starting libVLC's Java side. There is no Java
-//! code in the app.
+//! Wi-Fi multicast for network discovery, starting libVLC's Java side, and
+//! the player on the lock screen (`Playback` and `PlaybackService`, the
+//! app's only Java code, in `android/java`).
 
 use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,137 @@ pub fn init(app: &AndroidApp) {
     }
     start_libvlc_jni();
     use_cutout_area();
+    playback_init();
+}
+
+// ------------------------------------------------------------------ playback
+
+/// A press on the lock screen, in the notification or on headphones.
+#[derive(Clone, Copy, Debug)]
+pub enum MediaAction {
+    Play,
+    Pause,
+    Toggle,
+    Next,
+    Prev,
+    /// To this many ms.
+    SeekTo(i64),
+    /// By this many ms.
+    SeekBy(i64),
+    Stop,
+}
+
+static PLAYBACK_CLASS: OnceLock<GlobalRef> = OnceLock::new();
+static MEDIA_ACTIONS: std::sync::Mutex<Vec<MediaAction>> = std::sync::Mutex::new(Vec::new());
+static MEDIA_WAKE: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+extern "system" fn playback_action(_env: JNIEnv, _class: jni::objects::JClass, code: jni::sys::jint, arg: jni::sys::jlong) {
+    let action = match code {
+        1 => MediaAction::Play,
+        2 => MediaAction::Pause,
+        7 => MediaAction::Toggle,
+        3 => MediaAction::Next,
+        4 => MediaAction::Prev,
+        5 if arg == -10001 => MediaAction::SeekBy(10_000),
+        5 if arg == -10002 => MediaAction::SeekBy(-10_000),
+        5 => MediaAction::SeekTo(arg.max(0)),
+        6 => MediaAction::Stop,
+        _ => return,
+    };
+    log::info!("media button: {action:?}");
+    if let Ok(mut q) = MEDIA_ACTIONS.lock() {
+        q.push(action);
+    }
+    if let Some(wake) = MEDIA_WAKE.get() {
+        wake();
+    }
+}
+
+/// Sets up the media session (see `Playback.java`).
+fn playback_init() {
+    let class = with_env(|env, activity| {
+        let loader = env.call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
+        let name = env.new_string("org.resumo.app.Playback")?;
+        let class = env.call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])?.l()?;
+        let class = jni::objects::JClass::from(class);
+        env.register_native_methods(
+            &class,
+            &[jni::NativeMethod { name: "action".into(), sig: "(IJ)V".into(), fn_ptr: playback_action as *mut c_void }],
+        )?;
+        let icon = env.byte_array_from_slice(crate::ICON_PNG)?;
+        env.call_static_method(&class, "init", "(Landroid/app/Activity;[B)V", &[JValue::Object(activity), JValue::Object(&icon)])?;
+        env.new_global_ref(class)
+    });
+    match class {
+        Some(c) => {
+            let _ = PLAYBACK_CLASS.set(c);
+        }
+        None => log::warn!("no media session: Playback class missing"),
+    }
+}
+
+/// Called when a press comes in (from any thread).
+pub fn on_media_action(wake: impl Fn() + Send + Sync + 'static) {
+    let _ = MEDIA_WAKE.set(Box::new(wake));
+}
+
+pub fn take_media_actions() -> Vec<MediaAction> {
+    MEDIA_ACTIONS.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default()
+}
+
+/// What the lock screen and the notification show. `title` None: nothing
+/// loaded, they go away.
+pub fn publish_playback(title: Option<&str>, subtitle: &str, playing: bool, position_ms: i64, length_ms: Option<i64>, rate: f32) {
+    let Some(class) = PLAYBACK_CLASS.get() else { return };
+    with_env(|env, _| {
+        let t = env.new_string(title.unwrap_or(""))?;
+        let sub = env.new_string(subtitle)?;
+        let class = <&jni::objects::JClass>::from(class.as_obj());
+        env.call_static_method(
+            class,
+            "update",
+            "(ZLjava/lang/String;Ljava/lang/String;ZJJF)V",
+            &[
+                JValue::Bool(title.is_some() as u8),
+                JValue::Object(&t),
+                JValue::Object(&sub),
+                JValue::Bool(playing as u8),
+                JValue::Long(position_ms.max(0)),
+                JValue::Long(length_ms.unwrap_or(-1)),
+                JValue::Float(rate),
+            ],
+        )?;
+        Ok(())
+    });
+}
+
+/// Whether the screen is off or locked (the app keeps playing then).
+pub fn screen_locked() -> bool {
+    with_env(|env, activity| {
+        let name = env.new_string("power")?;
+        let pm = env.call_method(activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[JValue::Object(&name)])?.l()?;
+        let interactive = env.call_method(&pm, "isInteractive", "()Z", &[])?.z()?;
+        let name = env.new_string("keyguard")?;
+        let km = env.call_method(activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[JValue::Object(&name)])?.l()?;
+        let locked = env.call_method(&km, "isKeyguardLocked", "()Z", &[])?.z()?;
+        Ok(!interactive || locked)
+    })
+    .unwrap_or(false)
+}
+
+/// Android 13+: asks once for notifications, where the player shows its
+/// controls (some phones keep media controls off the lock screen without it).
+pub fn request_notifications() {
+    static ASKED: AtomicBool = AtomicBool::new(false);
+    if sdk_int() < 33 || ASKED.swap(true, Ordering::SeqCst) || permission_granted("android.permission.POST_NOTIFICATIONS") {
+        return;
+    }
+    with_env(|env, activity| {
+        let perm = env.new_string("android.permission.POST_NOTIFICATIONS")?;
+        let arr = env.new_object_array(1, "java/lang/String", &perm)?;
+        env.call_method(activity, "requestPermissions", "([Ljava/lang/String;I)V", &[JValue::Object(&arr), JValue::Int(7)])?;
+        Ok(())
+    });
 }
 
 /// libVLC's subtitle renderer (freetype, and libass for ASS) finds fonts
@@ -35,18 +167,20 @@ pub fn init(app: &AndroidApp) {
 fn setup_fontconfig(data_dir: &Path) {
     let conf = data_dir.join("fonts.conf");
     let cache = data_dir.join("fontconfig-cache");
+    let fonts = data_dir.join("fonts");
+    link_subtitle_fonts(&fonts);
     let text = format!(
         r#"<?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
-  <dir>/system/fonts</dir>
-  <dir>/product/fonts</dir>
+  <dir>{}</dir>
   <cachedir>{}</cachedir>
-  <alias><family>sans-serif</family><prefer><family>Roboto</family><family>Noto Sans</family></prefer></alias>
+  <alias><family>sans-serif</family><prefer><family>Roboto</family><family>Roboto Static</family><family>Droid Sans</family></prefer></alias>
   <alias><family>serif</family><prefer><family>Noto Serif</family></prefer></alias>
   <alias><family>Arial</family><prefer><family>Roboto</family></prefer></alias>
 </fontconfig>
 "#,
+        fonts.display(),
         cache.display()
     );
     if std::fs::read_to_string(&conf).ok().as_deref() != Some(text.as_str()) {
@@ -57,7 +191,7 @@ fn setup_fontconfig(data_dir: &Path) {
     std::env::set_var("FONTCONFIG_FILE", &conf);
     std::env::set_var("FONTCONFIG_PATH", data_dir);
 
-    // The first scan of the system fonts takes a few seconds; do it now in
+    // The first scan of the fonts takes a moment; do it now in
     // the background (libVLC exports fontconfig) rather than when the first
     // subtitle appears.
     std::thread::Builder::new()
@@ -69,6 +203,30 @@ fn setup_fontconfig(data_dir: &Path) {
             }
         })
         .ok();
+}
+
+/// Fills `dir` with links to the system fonts subtitles need. Fontconfig
+/// reads every font in the folders it is given, all of each font's faces and
+/// glyphs, before it writes its cache: given all of `/system/fonts` (the CJK
+/// collections and dozens of variable fonts on recent Android), that kept a
+/// core busy for minutes after every start, and the cache was never written
+/// if the app was closed before the scan finished.
+fn link_subtitle_fonts(dir: &Path) {
+    const WANTED: [&str; 6] = ["Roboto-", "RobotoStatic-", "DroidSans", "NotoSerif-", "NotoNaskhArabic-", "NotoSansHebrew-"];
+    let _ = std::fs::create_dir_all(dir);
+    for sys in ["/system/fonts", "/product/fonts"] {
+        let Ok(entries) = std::fs::read_dir(sys) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if WANTED.iter().any(|w| n.starts_with(w)) && (n.ends_with(".ttf") || n.ends_with(".otf")) {
+                let link = dir.join(n);
+                if std::fs::symlink_metadata(&link).is_err() {
+                    let _ = std::os::unix::fs::symlink(e.path(), &link);
+                }
+            }
+        }
+    }
 }
 
 /// A symbol exported by libvlc.so.
@@ -748,7 +906,9 @@ fn app_visible() -> bool {
 /// Pauses video when the app goes to the background. While the app is
 /// hidden Android takes the window away and the UI stops running, so frames
 /// that stop coming, and Android confirming the app is not on screen, mean
-/// "hidden". Audio-only media keeps playing, like in music players.
+/// "hidden". Audio-only media keeps playing, like in music players, and so
+/// does everything while the screen is off or locked (the sound goes on,
+/// see `PlayerApp::background_tick`).
 pub struct BackgroundGuard {
     shared: Arc<GuardState>,
 }
@@ -782,7 +942,12 @@ impl BackgroundGuard {
                 let idle = s.now_ms().saturating_sub(s.last_frame_ms.load(Ordering::SeqCst));
                 // Frames also stall for a moment while a network video opens, so
                 // ask Android before pausing.
-                if idle > 1500 && s.has_video.load(Ordering::SeqCst) && !s.paused.load(Ordering::SeqCst) && !app_visible() {
+                if idle > 1500
+                    && s.has_video.load(Ordering::SeqCst)
+                    && !s.paused.load(Ordering::SeqCst)
+                    && !app_visible()
+                    && !screen_locked()
+                {
                     s.paused.store(true, Ordering::SeqCst);
                     log::info!("app hidden, pausing video");
                     pause();

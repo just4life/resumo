@@ -29,6 +29,9 @@ use crate::platform;
 
 const TEXTURE_EXTERNAL_OES: u32 = 0x8D65;
 
+/// How often `AWindow` is checked for still holding the video layer.
+const ATTACH_CHECK: Duration = Duration::from_millis(300);
+
 /// Biggest picture kept: the TV's window is drawn at no more than 1080p.
 /// When to move the layer a little after a new video is opened, in
 /// milliseconds (see [`SurfaceVideo::reset`]).
@@ -110,8 +113,9 @@ struct VideoView {
     view: GlobalRef,
     /// Where it was last put, in window pixels.
     rect: Option<[i32; 4]>,
-    /// Frames until `AWindow` is checked for being attached again.
-    check_in: u32,
+    /// When `AWindow` was last checked for being attached. By the clock,
+    /// not in frames: frames come seldom while nothing moves on screen.
+    checked: Option<Instant>,
     /// When to move it a little (see [`SurfaceVideo::reset`]).
     nudges: Vec<Instant>,
 }
@@ -213,7 +217,7 @@ impl SurfaceVideo {
                 awindow,
                 listener,
                 video: layer(video, video_oes),
-                view: view.map(|view| VideoView { view, rect: None, check_in: 0, nudges: Vec::new() }),
+                view: view.map(|view| VideoView { view, rect: None, checked: None, nudges: Vec::new() }),
                 subs: layer(subs, subs_oes),
                 matrix,
                 program,
@@ -269,6 +273,20 @@ impl SurfaceVideo {
         }
     }
 
+    /// Gives the video layer back to `AWindow` if it let go of it (the app
+    /// was in the background). Called before a video starts: a decoder that
+    /// starts with no layer to draw into falls back to the processor, which
+    /// a 4K video brings to its knees.
+    pub fn ensure_attached(&mut self) {
+        let Some(v) = &mut self.view else { return };
+        v.checked = Some(Instant::now());
+        let attached = platform::with_env(|env, _| env.call_method(self.awindow.as_obj(), "areViewsAttached", "()Z", &[])?.z());
+        if attached == Some(false) {
+            let ok = attach_views(&self.awindow, &self.listener, &v.view, &self.subs.st);
+            log::info!("video layer given back before playing: {ok}");
+        }
+    }
+
     /// The `AWindow` for `libvlc_media_player_set_android_context`.
     pub fn awindow(&self) -> *mut std::ffi::c_void {
         self.awindow.as_obj().as_raw() as *mut _
@@ -304,9 +322,8 @@ impl SurfaceVideo {
         if let Some(v) = &mut self.view {
             // The layer's surface goes away with the window, and `AWindow`
             // lets go of the views then: give them back once it is there.
-            v.check_in = v.check_in.saturating_sub(1);
-            if v.check_in == 0 {
-                v.check_in = 30;
+            if v.checked.is_none_or(|t| t.elapsed() >= ATTACH_CHECK) {
+                v.checked = Some(Instant::now());
                 let attached = platform::with_env(|env, _| env.call_method(self.awindow.as_obj(), "areViewsAttached", "()Z", &[])?.z());
                 if attached == Some(false) {
                     reattached = attach_views(&self.awindow, &self.listener, &v.view, &self.subs.st);

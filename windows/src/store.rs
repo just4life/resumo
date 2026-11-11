@@ -44,6 +44,10 @@ pub struct Store {
     pub hdr_off: bool,
     /// Brightness of converted HDR video, percent (100 = default).
     pub hdr_brightness: Option<i32>,
+    /// Subtitle text size, percent.
+    pub subtitle_scale: Option<i32>,
+    /// Subtitle lift as a share of the picture height.
+    pub subtitle_lift: Option<f32>,
     dirty: bool,
 }
 
@@ -71,6 +75,8 @@ impl Store {
                     Some(("audio_device", v)) if !v.is_empty() => store.audio_device = Some(v.to_owned()),
                     Some(("hdr_to_sdr", v)) => store.hdr_off = v.trim() == "off",
                     Some(("hdr_brightness", v)) => store.hdr_brightness = v.trim().parse().ok(),
+                    Some(("subtitle_scale", v)) => store.subtitle_scale = v.trim().parse().ok(),
+                    Some(("subtitle_lift", v)) => store.subtitle_lift = v.trim().parse().ok().filter(|f: &f32| f.is_finite()),
                     _ => {}
                 }
             }
@@ -136,6 +142,20 @@ impl Store {
         }
     }
 
+    pub fn set_subtitle_scale(&mut self, percent: i32) {
+        if self.subtitle_scale != Some(percent) {
+            self.subtitle_scale = Some(percent);
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_subtitle_lift(&mut self, lift: f32) {
+        if self.subtitle_lift != Some(lift) {
+            self.subtitle_lift = Some(lift);
+            self.dirty = true;
+        }
+    }
+
     /// Writes both files if anything changed since the last save.
     pub fn save(&mut self) {
         if !self.dirty {
@@ -165,6 +185,12 @@ impl Store {
         if let Some(b) = self.hdr_brightness {
             settings.push_str(&format!("hdr_brightness={b}\n"));
         }
+        if let Some(p) = self.subtitle_scale {
+            settings.push_str(&format!("subtitle_scale={p}\n"));
+        }
+        if let Some(l) = self.subtitle_lift {
+            settings.push_str(&format!("subtitle_lift={l}\n"));
+        }
         let ok = write_atomic(&dir.join("positions.tsv"), &positions)
             && write_atomic(&dir.join("settings.txt"), &settings);
         if ok {
@@ -193,6 +219,8 @@ mod tests {
         s.set_audio_device(Some("hw:1,0".into()));
         s.set_hdr_off(true);
         s.set_hdr_brightness(85);
+        s.set_subtitle_scale(150);
+        s.set_subtitle_lift(0.125);
         s.save();
 
         let mut t = Store::load_from(Some(dir.clone()));
@@ -203,6 +231,8 @@ mod tests {
         assert_eq!(t.audio_device.as_deref(), Some("hw:1,0"));
         assert!(t.hdr_off);
         assert_eq!(t.hdr_brightness, Some(85));
+        assert_eq!(t.subtitle_scale, Some(150));
+        assert_eq!(t.subtitle_lift, Some(0.125));
 
         // Watching to the end forgets the saved position.
         t.set_position("/v/a.mkv", 599_000, Some(600_000));

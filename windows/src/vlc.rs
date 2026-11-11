@@ -207,6 +207,38 @@ extern "C" {
     fn libvlc_free(ptr: *mut c_void);
 }
 
+// A few libVLC core functions for what the public API can't do: subtitle text
+// size and position. They work on object variables, as VLC's own hotkeys do.
+// A media player is a core object (`vlc_object_t`), and its video outputs are
+// its children.
+#[repr(C)]
+#[derive(Clone, Copy)]
+union vlc_value_t {
+    i_int: i64,
+    p_address: *mut c_void,
+}
+#[repr(C)]
+struct vlc_list_t {
+    i_type: c_int,
+    i_count: c_int,
+    p_values: *mut vlc_value_t,
+}
+const VLC_VAR_INTEGER: c_int = 0x0030;
+const VLC_VAR_DOINHERIT: c_int = 0x8000;
+
+#[cfg_attr(windows, link(name = "libvlccore"))]
+#[cfg_attr(not(windows), link(name = "vlccore"))]
+extern "C" {
+    fn var_Create(obj: *mut c_void, name: *const c_char, type_: c_int) -> c_int;
+    fn var_Type(obj: *mut c_void, name: *const c_char) -> c_int;
+    fn var_SetChecked(obj: *mut c_void, name: *const c_char, type_: c_int, val: vlc_value_t) -> c_int;
+    fn vlc_list_children(obj: *mut c_void) -> *mut vlc_list_t;
+    fn vlc_list_release(list: *mut vlc_list_t);
+}
+
+/// Subtitle text size in percent, as VLC's `--sub-text-scale` allows.
+pub const SUB_SCALE_RANGE: std::ops::RangeInclusive<i32> = 10..=500;
+
 fn last_error() -> String {
     unsafe {
         let p = libvlc_errmsg();
@@ -587,6 +619,47 @@ impl MediaPlayer {
     pub fn add_subtitle_file(&self, uri: &str) -> bool {
         let Ok(c) = CString::new(uri) else { return false };
         unsafe { libvlc_media_player_add_slave(self.raw, SLAVE_TYPE_SUBTITLE, c.as_ptr(), true) == 0 }
+    }
+
+    /// Sets an integer variable on the player, so video outputs created
+    /// later inherit it, and on every live video output that has it.
+    fn set_int_var(&self, name: &str, value: i64, live_outputs: bool) {
+        let Ok(name) = CString::new(name) else { return };
+        let obj = self.raw as *mut c_void;
+        let val = vlc_value_t { i_int: value };
+        unsafe {
+            if var_Type(obj, name.as_ptr()) == 0 {
+                var_Create(obj, name.as_ptr(), VLC_VAR_INTEGER | VLC_VAR_DOINHERIT);
+            }
+            var_SetChecked(obj, name.as_ptr(), VLC_VAR_INTEGER, val);
+            if !live_outputs {
+                return;
+            }
+            let list = vlc_list_children(obj);
+            if list.is_null() {
+                return;
+            }
+            for i in 0..(*list).i_count.max(0) as usize {
+                let child = (*(*list).p_values.add(i)).p_address;
+                if !child.is_null() && var_Type(child, name.as_ptr()) & 0xf0 == VLC_VAR_INTEGER {
+                    var_SetChecked(child, name.as_ptr(), VLC_VAR_INTEGER, val);
+                }
+            }
+            vlc_list_release(list);
+        }
+    }
+
+    /// Size of text subtitles in percent (100 = VLC's default).
+    /// The text renderer reads it for every subtitle it draws.
+    pub fn set_subtitle_scale(&self, percent: i32) {
+        let p = percent.clamp(*SUB_SCALE_RANGE.start(), *SUB_SCALE_RANGE.end());
+        self.set_int_var("sub-text-scale", p as i64, false);
+    }
+
+    /// Lifts subtitles this many video pixels above their usual place
+    /// (negative: lower; VLC keeps them inside the picture).
+    pub fn set_subtitle_margin(&self, pixels: i32) {
+        self.set_int_var("sub-margin", pixels as i64, true);
     }
 
 }

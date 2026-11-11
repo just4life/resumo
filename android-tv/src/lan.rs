@@ -155,6 +155,8 @@ impl Lan {
                 }
                 for mut item in list_items(ml) {
                     item.is_dir = true;
+                    // Ready by the time it is opened.
+                    find_address(&item.mrl);
                     if !out.iter().any(|o| o.mrl == item.mrl) {
                         out.push(item);
                     }
@@ -168,37 +170,79 @@ impl Lan {
 
     /// Starts listing a server, share or folder.
     pub fn open(&self, mrl: &str) -> Listing {
-        let md = CString::new(mrl).map_or(std::ptr::null_mut(), |c| unsafe {
-            libvlc_media_new_location(self.0.inst.raw, c.as_ptr())
-        });
-        if !md.is_null() {
-            unsafe {
-                for o in media_options(mrl) {
-                    if let Ok(o) = CString::new(o) {
-                        libvlc_media_add_option(md, o.as_ptr());
-                    }
-                }
-                libvlc_media_parse_with_options(md, PARSE_NETWORK | DO_INTERACT, LIST_TIMEOUT_MS);
+        // Opened by the server's address (see `ADDRESSES`), once that is
+        // found: `Listing::poll` starts it.
+        find_address(mrl);
+        Listing {
+            md: std::cell::Cell::new(std::ptr::null_mut()),
+            inst: self.0.inst.clone(),
+            mrl: mrl.to_owned(),
+            sent: std::cell::RefCell::new(None),
+            asked: std::time::Instant::now(),
+        }
+    }
+}
+
+/// libVLC objects on their way to being let go of on a thread of their
+/// own: stopping them waits for libVLC's threads, which may be stuck in the
+/// network (a name that doesn't resolve, a server that doesn't answer). On
+/// the UI thread that wait froze the app until Android offered to close it.
+struct LetGo {
+    discoverers: Vec<*mut libvlc_media_discoverer_t>,
+    media: *mut libvlc_media_t,
+    /// Kept until the rest is gone.
+    _inst: Option<Instance>,
+}
+// SAFETY: libVLC objects may be stopped and released on any thread.
+unsafe impl Send for LetGo {}
+
+impl LetGo {
+    fn run(self) {
+        unsafe {
+            for &md in &self.discoverers {
+                libvlc_media_discoverer_stop(md);
+                libvlc_media_discoverer_release(md);
+            }
+            if !self.media.is_null() {
+                libvlc_media_parse_stop(self.media);
+                libvlc_media_release(self.media);
             }
         }
-        Listing { md }
+    }
+
+    fn off_thread(self) {
+        let slot = std::sync::Arc::new(Mutex::new(Some(self)));
+        let theirs = slot.clone();
+        let spawned = std::thread::Builder::new().name("lan-let-go".into()).spawn(move || {
+            if let Some(job) = theirs.lock().unwrap().take() {
+                job.run();
+            }
+        });
+        if spawned.is_err() {
+            if let Some(job) = slot.lock().unwrap().take() {
+                job.run();
+            }
+        }
     }
 }
 
 impl Drop for Discovery {
     fn drop(&mut self) {
-        for &md in &self.discoverers {
-            unsafe {
-                libvlc_media_discoverer_stop(md);
-                libvlc_media_discoverer_release(md);
-            }
-        }
+        LetGo { discoverers: std::mem::take(&mut self.discoverers), media: std::ptr::null_mut(), _inst: Some(self.inst.clone()) }.off_thread();
     }
 }
 
 /// A folder being listed in the background.
 pub struct Listing {
-    md: *mut libvlc_media_t,
+    /// Null until the listing is started.
+    md: std::cell::Cell<*mut libvlc_media_t>,
+    inst: Instance,
+    /// The folder, by the server's name.
+    mrl: String,
+    /// What libVLC was given for it (by address, if that was found); `None`
+    /// until the listing is started.
+    sent: std::cell::RefCell<Option<String>>,
+    asked: std::time::Instant,
 }
 
 pub enum ListState {
@@ -208,20 +252,61 @@ pub enum ListState {
 }
 
 impl Listing {
+    /// Hands the folder to libVLC, by the server's address when it is known.
+    fn start(&self) {
+        let sent = by_address(&self.mrl);
+        let md = CString::new(sent.as_str()).map_or(std::ptr::null_mut(), |c| unsafe {
+            libvlc_media_new_location(self.inst.raw, c.as_ptr())
+        });
+        if !md.is_null() {
+            unsafe {
+                // The login is kept by the server's name.
+                for o in media_options(&self.mrl) {
+                    if let Ok(o) = CString::new(o) {
+                        libvlc_media_add_option(md, o.as_ptr());
+                    }
+                }
+                libvlc_media_parse_with_options(md, PARSE_NETWORK | DO_INTERACT, LIST_TIMEOUT_MS);
+            }
+        }
+        self.md.set(md);
+        *self.sent.borrow_mut() = Some(sent);
+    }
+
     pub fn poll(&self) -> ListState {
-        if self.md.is_null() {
+        if self.sent.borrow().is_none() {
+            if address_pending(&self.mrl) && self.asked.elapsed() < ADDRESS_WAIT {
+                return ListState::Loading;
+            }
+            self.start();
+        }
+        let md = self.md.get();
+        if md.is_null() {
             return ListState::Failed;
         }
         unsafe {
-            match libvlc_media_get_parsed_status(self.md) {
+            match libvlc_media_get_parsed_status(md) {
                 0 => ListState::Loading,
                 PARSED_DONE => {
-                    let ml = libvlc_media_subitems(self.md);
+                    let ml = libvlc_media_subitems(md);
                     if ml.is_null() {
                         return ListState::Done(Vec::new());
                     }
-                    let items = list_items(ml);
+                    let mut items = list_items(ml);
                     libvlc_media_list_release(ml);
+                    // Back by name: what was listed by address.
+                    if let (Some((at, _)), Some(sent)) = (smb_name(&self.mrl), self.sent.borrow().as_deref()) {
+                        let by_name = &self.mrl[..at.end];
+                        let by_addr = &sent[..sent.len() - (self.mrl.len() - at.end)];
+                        if by_name != by_addr {
+                            for item in &mut items {
+                                let rest = item.mrl.strip_prefix(by_addr).filter(|r| r.is_empty() || r.starts_with('/'));
+                                if let Some(rest) = rest {
+                                    item.mrl = format!("{by_name}{rest}");
+                                }
+                            }
+                        }
+                    }
                     ListState::Done(items)
                 }
                 _ => ListState::Failed,
@@ -232,11 +317,8 @@ impl Listing {
 
 impl Drop for Listing {
     fn drop(&mut self) {
-        if !self.md.is_null() {
-            unsafe {
-                libvlc_media_parse_stop(self.md);
-                libvlc_media_release(self.md);
-            }
+        if !self.md.get().is_null() {
+            LetGo { discoverers: Vec::new(), media: self.md.get(), _inst: None }.off_thread();
         }
     }
 }
@@ -723,6 +805,196 @@ pub fn is_openable(item: &NetItem) -> bool {
     }
 }
 
+// ------------------------------------------------------- server addresses
+
+/// How long a folder or a video waits for its server's address to be found
+/// before it is opened by name after all.
+const ADDRESS_WAIT: std::time::Duration = std::time::Duration::from_millis(1200);
+/// A found address is looked up again after this long (it can change), a
+/// name that wasn't found is tried again.
+const ADDRESS_KEPT: std::time::Duration = std::time::Duration::from_secs(300);
+const ADDRESS_RETRY: std::time::Duration = std::time::Duration::from_secs(20);
+
+enum Address {
+    Looking,
+    Found(String, std::time::Instant),
+    Unknown(std::time::Instant),
+}
+
+/// Servers' addresses by name (lower case). libVLC looks a server's name up
+/// again for every folder and file it opens, and on some networks (a private
+/// DNS, a VPN, a router that doesn't know the name) each lookup takes many
+/// seconds. The player finds the address once, the way Windows does on a
+/// home network, and hands libVLC the address instead of the name.
+static ADDRESSES: Mutex<Vec<(String, Address)>> = Mutex::new(Vec::new());
+
+/// The server's name in `mrl` when it is a name to look up (`smb://name/…`,
+/// not an address, no user or port in it), and where it is in `mrl`.
+fn smb_name(mrl: &str) -> Option<(std::ops::Range<usize>, String)> {
+    let scheme = mrl.get(..6)?;
+    if !scheme.eq_ignore_ascii_case("smb://") {
+        return None;
+    }
+    let host = mrl[6..].split('/').next()?;
+    if host.is_empty() || host.contains(['@', ':', '%']) || host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some((6..6 + host.len(), host.to_lowercase()))
+}
+
+/// Starts looking for the address of `mrl`'s server, if that isn't known
+/// (or is old). Returns at once.
+pub fn find_address(mrl: &str) {
+    let Some((_, name)) = smb_name(mrl) else { return };
+    let mut all = ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+    let known = all.iter().position(|(n, _)| *n == name);
+    match known.map(|i| &all[i].1) {
+        Some(Address::Looking) => return,
+        Some(Address::Found(_, at)) if at.elapsed() < ADDRESS_KEPT => return,
+        Some(Address::Unknown(at)) if at.elapsed() < ADDRESS_RETRY => return,
+        // An old address stays in use while it is looked up again.
+        Some(Address::Found(..)) => {}
+        Some(Address::Unknown(_)) => all[known.unwrap()].1 = Address::Looking,
+        None => all.push((name.clone(), Address::Looking)),
+    }
+    if let Some(i) = known {
+        if let Address::Found(_, at) = &mut all[i].1 {
+            // Not asked for again while this lookup runs.
+            *at = std::time::Instant::now();
+        }
+    }
+    drop(all);
+    let looked = name.clone();
+    let spawned = std::thread::Builder::new().name("server-address".into()).spawn(move || {
+        let found = netbios_address(&looked).or_else(|| dns_address(&looked));
+        log::info!("address of {looked}: {found:?}");
+        let mut all = ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = all.iter_mut().find(|(n, _)| *n == looked) {
+            match found {
+                Some(ip) => entry.1 = Address::Found(ip, std::time::Instant::now()),
+                // A lookup that fails doesn't take a working address away.
+                None if matches!(entry.1, Address::Found(..)) => {}
+                None => entry.1 = Address::Unknown(std::time::Instant::now()),
+            }
+        }
+    });
+    if spawned.is_err() {
+        let mut all = ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = all.iter_mut().find(|(n, _)| *n == name) {
+            if matches!(entry.1, Address::Looking) {
+                entry.1 = Address::Unknown(std::time::Instant::now());
+            }
+        }
+    }
+}
+
+/// Whether the address of `mrl`'s server is still being looked for.
+fn address_pending(mrl: &str) -> bool {
+    let Some((_, name)) = smb_name(mrl) else { return false };
+    let all = ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+    all.iter().any(|(n, a)| *n == name && matches!(a, Address::Looking))
+}
+
+/// `mrl` as libVLC gets it: with the server's address in place of its name,
+/// when that is known. Everything the player keeps (the playlist, positions,
+/// logins) stays by name.
+pub fn by_address(mrl: &str) -> String {
+    let Some((at, name)) = smb_name(mrl) else { return mrl.to_owned() };
+    let all = ADDRESSES.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter().find(|(n, _)| *n == name) {
+        Some((_, Address::Found(ip, _))) => format!("{}{}{}", &mrl[..at.start], ip, &mrl[at.end..]),
+        _ => mrl.to_owned(),
+    }
+}
+
+/// [`by_address`], waiting a moment for the address if it is being looked
+/// for (a video opened from the history right after the app started).
+pub fn by_address_waiting(mrl: &str) -> String {
+    find_address(mrl);
+    let began = std::time::Instant::now();
+    while address_pending(mrl) && began.elapsed() < ADDRESS_WAIT {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    by_address(mrl)
+}
+
+/// Asks the local network who has the Windows name `name` (a NetBIOS name
+/// query, broadcast, as Windows itself does): answered in milliseconds by
+/// the computer itself, whatever the DNS thinks.
+fn netbios_address(name: &str) -> Option<String> {
+    use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+    if name.len() > 15 || name.contains('.') || !name.is_ascii() {
+        return None;
+    }
+    let mut padded = [b' '; 16];
+    padded[..name.len()].copy_from_slice(name.to_ascii_uppercase().as_bytes());
+    // The file server's name.
+    padded[15] = 0x20;
+    let mut query = vec![0x52, 0x53, 0x01, 0x10, 0, 1, 0, 0, 0, 0, 0, 0, 32];
+    for b in padded {
+        query.push(b'A' + (b >> 4));
+        query.push(b'A' + (b & 0x0f));
+    }
+    query.extend([0, 0, 0x20, 0, 1]);
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.set_broadcast(true).ok()?;
+    socket.set_read_timeout(Some(std::time::Duration::from_millis(250))).ok()?;
+    let mut targets = vec![Ipv4Addr::BROADCAST];
+    // The network's own broadcast address too (taken as a /24, as home
+    // networks are): some routers drop the general one.
+    let own = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok().and_then(|s| {
+        s.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+        match s.local_addr().ok()? {
+            SocketAddr::V4(a) => Some(*a.ip()),
+            SocketAddr::V6(_) => None,
+        }
+    });
+    if let Some(ip) = own.filter(|ip| ip.is_private()) {
+        let [a, b, c, _] = ip.octets();
+        targets.push(Ipv4Addr::new(a, b, c, 255));
+    }
+    let mut buf = [0u8; 512];
+    for _ in 0..3 {
+        for t in &targets {
+            let _ = socket.send_to(&query, (*t, 137));
+        }
+        let began = std::time::Instant::now();
+        while began.elapsed() < std::time::Duration::from_millis(300) {
+            let Ok((n, _)) = socket.recv_from(&mut buf) else { break };
+            if let Some(ip) = netbios_answer(&buf[..n]) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+/// The first address in a positive answer to [`netbios_address`]'s query.
+fn netbios_answer(p: &[u8]) -> Option<String> {
+    // Ours, a response, no error, with an answer.
+    if p.len() < 62 || p[..2] != [0x52, 0x53] || p[2] & 0x80 == 0 || p[3] & 0x0f != 0 || (p[6], p[7]) == (0, 0) {
+        return None;
+    }
+    // Header (12), the name (34), type NB and class (4), TTL (4), length (2), flags (2).
+    if p[12] != 32 || (p[46], p[47]) != (0, 0x20) {
+        return None;
+    }
+    let length = u16::from_be_bytes([p[54], p[55]]) as usize;
+    if length < 6 {
+        return None;
+    }
+    let ip = std::net::Ipv4Addr::new(p[58], p[59], p[60], p[61]);
+    (!ip.is_unspecified() && !ip.is_loopback()).then(|| ip.to_string())
+}
+
+/// The system's own lookup (slow where the name isn't known, but then
+/// only once).
+fn dns_address(name: &str) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    let found = (name, 445).to_socket_addrs().ok()?;
+    found.filter(|a| a.is_ipv4()).map(|a| a.ip().to_string()).next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -761,5 +1033,32 @@ mod tests {
         assert!(is_openable(&item("Mr. Robot S01E01")));
         assert!(!is_openable(&item("cover.jpg")));
         assert!(!is_openable(&item("Film.srt")));
+    }
+
+    #[test]
+    fn server_names_and_addresses() {
+        assert_eq!(smb_name("smb://HOMEPC/Video/a.mkv"), Some((6..12, "homepc".to_owned())));
+        assert_eq!(smb_name("SMB://nas"), Some((6..9, "nas".to_owned())));
+        assert_eq!(smb_name("smb://192.168.1.10/Video"), None);
+        assert_eq!(smb_name("smb://user@nas/Video"), None);
+        assert_eq!(smb_name("smb://"), None);
+        assert_eq!(smb_name("http://nas/Video"), None);
+        ADDRESSES.lock().unwrap().push(("testpc".to_owned(), Address::Found("192.168.1.10".to_owned(), std::time::Instant::now())));
+        assert_eq!(by_address("smb://TestPC/Video/a b.mkv"), "smb://192.168.1.10/Video/a b.mkv");
+        assert_eq!(by_address("smb://other/Video"), "smb://other/Video");
+        assert!(!address_pending("smb://TestPC/Video"));
+    }
+
+    #[test]
+    fn netbios_answers() {
+        let mut p = vec![0x52, 0x53, 0x85, 0x00, 0, 0, 0, 1, 0, 0, 0, 0, 32];
+        p.extend([b'A'; 32]);
+        p.extend([0, 0, 0x20, 0, 1, 0, 0, 0x02, 0x58, 0, 6, 0, 0, 192, 168, 3, 19]);
+        assert_eq!(netbios_answer(&p).as_deref(), Some("192.168.3.19"));
+        // Not found (name error).
+        let mut none = p.clone();
+        none[3] = 0x03;
+        assert_eq!(netbios_answer(&none), None);
+        assert_eq!(netbios_answer(&p[..40]), None);
     }
 }

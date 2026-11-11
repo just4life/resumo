@@ -38,18 +38,20 @@ pub fn init(app: &AndroidApp) {
 fn setup_fontconfig(data_dir: &Path) {
     let conf = data_dir.join("fonts.conf");
     let cache = data_dir.join("fontconfig-cache");
+    let fonts = data_dir.join("fonts");
+    link_subtitle_fonts(&fonts);
     let text = format!(
         r#"<?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
 <fontconfig>
-  <dir>/system/fonts</dir>
-  <dir>/product/fonts</dir>
+  <dir>{}</dir>
   <cachedir>{}</cachedir>
-  <alias><family>sans-serif</family><prefer><family>Roboto</family><family>Noto Sans</family></prefer></alias>
+  <alias><family>sans-serif</family><prefer><family>Roboto</family><family>Roboto Static</family><family>Droid Sans</family></prefer></alias>
   <alias><family>serif</family><prefer><family>Noto Serif</family></prefer></alias>
   <alias><family>Arial</family><prefer><family>Roboto</family></prefer></alias>
 </fontconfig>
 "#,
+        fonts.display(),
         cache.display()
     );
     if std::fs::read_to_string(&conf).ok().as_deref() != Some(text.as_str()) {
@@ -60,7 +62,7 @@ fn setup_fontconfig(data_dir: &Path) {
     std::env::set_var("FONTCONFIG_FILE", &conf);
     std::env::set_var("FONTCONFIG_PATH", data_dir);
 
-    // The first scan of the system fonts takes a few seconds; do it now in
+    // The first scan of the fonts takes a moment; do it now in
     // the background (libVLC exports fontconfig) rather than when the first
     // subtitle appears.
     std::thread::Builder::new()
@@ -72,6 +74,30 @@ fn setup_fontconfig(data_dir: &Path) {
             }
         })
         .ok();
+}
+
+/// Fills `dir` with links to the system fonts subtitles need. Fontconfig
+/// reads every font in the folders it is given, all of each font's faces and
+/// glyphs, before it writes its cache: given all of `/system/fonts` (the CJK
+/// collections and dozens of variable fonts on recent Android), that kept a
+/// core busy for minutes after every start, and the cache was never written
+/// if the app was closed before the scan finished.
+fn link_subtitle_fonts(dir: &Path) {
+    const WANTED: [&str; 6] = ["Roboto-", "RobotoStatic-", "DroidSans", "NotoSerif-", "NotoNaskhArabic-", "NotoSansHebrew-"];
+    let _ = std::fs::create_dir_all(dir);
+    for sys in ["/system/fonts", "/product/fonts"] {
+        let Ok(entries) = std::fs::read_dir(sys) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if WANTED.iter().any(|w| n.starts_with(w)) && (n.ends_with(".ttf") || n.ends_with(".otf")) {
+                let link = dir.join(n);
+                if std::fs::symlink_metadata(&link).is_err() {
+                    let _ = std::os::unix::fs::symlink(e.path(), &link);
+                }
+            }
+        }
+    }
 }
 
 /// A symbol exported by libvlc.so.

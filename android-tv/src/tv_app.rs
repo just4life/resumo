@@ -1244,6 +1244,10 @@ impl PlayerApp {
         // No callback says a frame is ready: look for one every frame.
         if self.player.is_playing() {
             ctx.request_repaint();
+        } else {
+            // Opening or paused: the layer is still looked after (given back
+            // after the app was in the background, placed for a new video).
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 

@@ -44,6 +44,9 @@ const HOLD_DELAY: f64 = 0.35;
 const HOLD_RATE: f32 = 2.0;
 /// Moving further than this (points) while holding moves the window instead.
 const HOLD_SLOP: f32 = 6.0;
+/// How far Shift + drag may move subtitles, as a share of the picture height.
+const SUB_LIFT_MAX_UP: f32 = 0.9;
+const SUB_LIFT_MAX_DOWN: f32 = 0.2;
 /// Smallest window, in points (also set on the viewport in `main`).
 pub const MIN_WINDOW: egui::Vec2 = vec2(640.0, 380.0);
 
@@ -122,6 +125,15 @@ pub struct PlayerApp {
     crop: Crop,
     subtitle_delay_ms: i64,
     audio_delay_ms: i64,
+    /// Subtitle text size, percent.
+    subtitle_scale: i32,
+    /// How far subtitles are lifted above their usual place, as a share of
+    /// the picture height (so it suits any resolution).
+    subtitle_lift: f32,
+    /// `sub-margin` last given to libVLC, in video pixels.
+    subtitle_margin_px: Option<i32>,
+    /// Shift + drag on the video: (lift at the press, pointer y at the press).
+    subtitle_drag: Option<(f32, f32)>,
 
     seek_drag: Option<f32>,
     fullscreen: bool,
@@ -218,6 +230,10 @@ impl PlayerApp {
             crop: Crop::None,
             subtitle_delay_ms: 0,
             audio_delay_ms: 0,
+            subtitle_scale: store.subtitle_scale.unwrap_or(100),
+            subtitle_lift: store.subtitle_lift.unwrap_or(0.0),
+            subtitle_margin_px: None,
+            subtitle_drag: None,
             seek_drag: None,
             fullscreen: false,
             last_activity: Instant::now(),
@@ -244,6 +260,7 @@ impl PlayerApp {
             boosting: false,
             hold_dragged: false,
         };
+        app.player.set_subtitle_scale(app.subtitle_scale);
         app.add_paths(files, true);
         Ok(app)
     }
@@ -273,6 +290,8 @@ impl PlayerApp {
         self.selected = Some(index);
         self.subtitle_delay_ms = 0;
         self.audio_delay_ms = 0;
+        self.subtitle_margin_px = None;
+        self.subtitle_drag = None;
         self.seek_drag = None;
         self.pending_subtitles.clear();
         self.resume_at = self.store.position(&location);
@@ -677,6 +696,7 @@ impl PlayerApp {
                 None => self.texture = None,
             }
         }
+        self.apply_subtitle_margin();
         self.poll_saved_frames(ctx);
         if self.hdr_wait.is_some_and(|t| t.elapsed() >= HDR_FRAME_TIMEOUT) && self.player.is_playing() {
             self.hdr_wait = None;
@@ -791,6 +811,9 @@ impl PlayerApp {
     /// Press and move: drag the window, the video doubling as its handle.
     fn hold_on_video(&mut self, ctx: &egui::Context, resp: &egui::Response) {
         let held = resp.is_pointer_button_down_on() && ctx.input(|i| i.pointer.primary_down());
+        if self.drag_subtitles(ctx, resp, held) {
+            return;
+        }
         if !held {
             if self.boosting {
                 self.boosting = false;
@@ -821,6 +844,71 @@ impl PlayerApp {
         } else {
             ctx.request_repaint_after(Duration::from_millis(30));
         }
+    }
+
+    /// Shift + drag on the video moves subtitles up and down.
+    /// Returns true while this drag owns the mouse button.
+    fn drag_subtitles(&mut self, ctx: &egui::Context, resp: &egui::Response, held: bool) -> bool {
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let can = self.has_picture() && self.is_active();
+        if self.subtitle_drag.is_none() {
+            if !held || !shift || !can || self.boosting || self.hold_dragged {
+                if shift && can && resp.hovered() && !held {
+                    ctx.set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                }
+                return false;
+            }
+            let Some(y) = ctx.input(|i| i.pointer.press_origin()).map(|p| p.y) else { return false };
+            self.subtitle_drag = Some((self.subtitle_lift, y));
+        }
+        let Some((start, y0)) = self.subtitle_drag else { return false };
+        if !held {
+            self.subtitle_drag = None;
+            self.store.set_subtitle_lift(self.subtitle_lift);
+            return true;
+        }
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        if let Some(y) = ctx.input(|i| i.pointer.interact_pos()).map(|p| p.y) {
+            let shown = self.picture_rect().map_or(0.0, |r| r.height());
+            if shown > 1.0 {
+                // The picture may be cropped: lift is a share of the full frame.
+                let (w, h) = self.frame_size;
+                let full = shown / self.crop.uv_rect(w, h).height();
+                self.subtitle_lift = (start + (y0 - y) / full).clamp(-SUB_LIFT_MAX_DOWN, SUB_LIFT_MAX_UP);
+                self.apply_subtitle_margin();
+            }
+        }
+        true
+    }
+
+    /// Where the picture is drawn inside the video area.
+    fn picture_rect(&self) -> Option<Rect> {
+        if !self.has_picture() {
+            return None;
+        }
+        let (w, h) = self.frame_size;
+        let uv = self.crop.uv_rect(w, h);
+        Some(crop::fit(self.video_rect, (uv.width() * w) / (uv.height() * h)))
+    }
+
+    /// Hands the subtitle lift to libVLC in pixels of the current video.
+    fn apply_subtitle_margin(&mut self) {
+        let h = self.frame_size.1;
+        if h < 1.0 {
+            return;
+        }
+        let px = (self.subtitle_lift * h).round() as i32;
+        if self.subtitle_margin_px != Some(px) {
+            self.subtitle_margin_px = Some(px);
+            self.player.set_subtitle_margin(px);
+        }
+    }
+
+    fn set_subtitle_scale(&mut self, percent: i32) {
+        let p = percent.clamp(*vlc::SUB_SCALE_RANGE.start(), *vlc::SUB_SCALE_RANGE.end());
+        self.subtitle_scale = p;
+        self.player.set_subtitle_scale(p);
+        self.store.set_subtitle_scale(p);
     }
 
     /// "×2" at the top of the video while the hold speed-up is on.
@@ -1081,7 +1169,7 @@ impl PlayerApp {
                     theme::menu_icon(ui, Icon::Crop, "Кадрирование (C)", self.crop != Crop::None, |ui| {
                         self.crop_menu(ui)
                     });
-                    theme::menu_icon(ui, Icon::Subtitles, "Субтитры (S)", false, |ui| self.subtitle_menu(ui));
+                    theme::menu_icon_sticky(ui, Icon::Subtitles, "Субтитры (S)", false, |ui| self.subtitle_menu(ui));
                     theme::menu_icon(ui, Icon::Audio, "Аудиодорожка (A)", false, |ui| self.audio_menu(ui));
                     let speed = format!("{}×", trim_float(self.rate));
                     theme::menu_text(ui, &speed, "Скорость", |ui| self.speed_menu(ui));
@@ -1202,6 +1290,7 @@ impl PlayerApp {
         for t in &tracks {
             if ui.add(egui::Button::selectable(t.id == cur, track_name(t))).clicked() {
                 self.player.set_subtitle_track(t.id);
+                ui.close();
             }
         }
         ui.separator();
@@ -1213,6 +1302,36 @@ impl PlayerApp {
             ui.label("Задержка");
             if delay_editor(ui, &mut self.subtitle_delay_ms) {
                 self.player.set_subtitle_delay_ms(self.subtitle_delay_ms);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Размер");
+            let mut p = self.subtitle_scale;
+            if ui.small_button("−").clicked() {
+                p = scale_step(p, false);
+            }
+            ui.add(egui::DragValue::new(&mut p).range(vlc::SUB_SCALE_RANGE).speed(1).suffix(" %"));
+            if ui.small_button("+").clicked() {
+                p = scale_step(p, true);
+            }
+            if ui.small_button("0").on_hover_text("Обычный размер").clicked() {
+                p = 100;
+            }
+            if p != self.subtitle_scale {
+                self.set_subtitle_scale(p);
+            }
+        })
+        .response
+        .on_hover_text("Для текстовых субтитров (srt, vtt, встроенный текст)");
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Положение: Shift + перетаскивание").color(theme::TEXT_DIM));
+            if ui
+                .add_enabled(self.subtitle_lift != 0.0, egui::Button::new("Сбросить").small())
+                .clicked()
+            {
+                self.subtitle_lift = 0.0;
+                self.store.set_subtitle_lift(0.0);
+                self.apply_subtitle_margin();
             }
         });
     }
@@ -1495,7 +1614,10 @@ impl PlayerApp {
         resp.context_menu(|ui| {
             ui.set_min_width(200.0);
             ui.menu_button("Аудиодорожка", |ui| self.audio_menu(ui));
-            ui.menu_button("Субтитры", |ui| self.subtitle_menu(ui));
+            // Stays open while − / + are clicked; picking a track closes it.
+            egui::containers::menu::SubMenuButton::new("Субтитры")
+                .config(egui::containers::menu::MenuConfig::default().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside))
+                .ui(ui, |ui| self.subtitle_menu(ui));
             ui.menu_button("Кадрирование", |ui| self.crop_menu(ui));
             ui.menu_button("Скорость", |ui| self.speed_menu(ui));
             ui.menu_button("Аудиоустройство", |ui| self.audio_device_menu(ui));
@@ -1707,6 +1829,13 @@ fn track_name(t: &vlc::Track) -> String {
     }
 }
 
+/// Next subtitle size for − / +: steps of 10 % near 100 %, 25 % further out.
+fn scale_step(percent: i32, up: bool) -> i32 {
+    let step = if (percent - 100).abs() < 50 || (percent == 150 && !up) || (percent == 50 && up) { 10 } else { 25 };
+    let next = if up { (percent / step + 1) * step } else { (percent + step - 1) / step * step - step };
+    next.clamp(*vlc::SUB_SCALE_RANGE.start(), *vlc::SUB_SCALE_RANGE.end())
+}
+
 /// `-100 ms [ 0 ] +100 ms` editor; returns true when the value changed.
 fn delay_editor(ui: &mut Ui, ms: &mut i64) -> bool {
     let before = *ms;
@@ -1750,5 +1879,22 @@ mod tests {
         assert_eq!(trim_float(1.5), "1.5");
         assert_eq!(trim_float(1.15), "1.15");
         assert_eq!(trim_float(2.0), "2");
+    }
+
+    #[test]
+    fn subtitle_scale_steps() {
+        assert_eq!(scale_step(100, true), 110);
+        assert_eq!(scale_step(100, false), 90);
+        assert_eq!(scale_step(140, true), 150);
+        assert_eq!(scale_step(150, true), 175);
+        assert_eq!(scale_step(175, false), 150);
+        assert_eq!(scale_step(150, false), 140);
+        assert_eq!(scale_step(60, false), 50);
+        assert_eq!(scale_step(50, false), 25);
+        assert_eq!(scale_step(25, true), 50);
+        assert_eq!(scale_step(50, true), 60);
+        assert_eq!(scale_step(105, true), 110);
+        assert_eq!(scale_step(500, true), 500);
+        assert_eq!(scale_step(10, false), 10);
     }
 }
