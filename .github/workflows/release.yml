@@ -1,0 +1,127 @@
+# Builds the binaries and attaches them to a GitHub release.
+#
+# Publishing a release (Releases -> Draft a new release -> Publish) starts it;
+# a few minutes later the release gets:
+#   Resumo-windows-x64.zip          portable Windows version
+#   Resumo-Setup-<version>.exe/.zip Windows installer
+#   Resumo-android-arm64.apk        Android
+#   Resumo-androidtv.apk            Android TV (ARM 32 and 64 bit)
+#
+# It can also be run by hand (Actions -> Release builds -> Run workflow); the
+# files are then only kept as the run's artifacts.
+#
+# APK signing: the keystores are not in the repository. Each one is stored as
+# a repository secret holding the base64 of the .keystore file:
+#   ANDROID_KEYSTORE_BASE64     android/android/resumo.keystore
+#   ANDROIDTV_KEYSTORE_BASE64   android-tv/android/resumo.keystore
+# Without the secret the APK is signed with a fresh throwaway key, so it will
+# not install over an APK signed with the usual key.
+name: Release builds
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+
+env:
+  CARGO_TERM_COLOR: always
+  # libVLC for Windows (NuGet VideoLAN.LibVLC.Windows); Android takes its
+  # libVLC version from build-apk.sh.
+  VLC_WINDOWS_VERSION: 3.0.24
+
+jobs:
+  windows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 nsis zip
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows
+      - uses: actions/cache@v4
+        with:
+          path: ~/libvlc-windows
+          key: libvlc-windows-${{ env.VLC_WINDOWS_VERSION }}
+      - name: Download libVLC for Windows
+        run: |
+          dir=~/libvlc-windows/$VLC_WINDOWS_VERSION
+          if [ ! -f "$dir/build/x64/libvlc.dll" ]; then
+            mkdir -p "$dir"
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/libvlc.nupkg" \
+              "https://api.nuget.org/v3-flatcontainer/videolan.libvlc.windows/$VLC_WINDOWS_VERSION/videolan.libvlc.windows.$VLC_WINDOWS_VERSION.nupkg"
+            unzip -q "$RUNNER_TEMP/libvlc.nupkg" 'build/x64/*' -d "$dir"
+          fi
+          echo "VLC_LIB_DIR=$dir/build/x64" >> "$GITHUB_ENV"
+      - run: sh installer/build-windows.sh
+        working-directory: windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            windows/dist/Resumo-windows-x64.zip
+            windows/dist/Resumo-Setup-*.exe
+            windows/dist/Resumo-Setup-*.zip
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: android
+            dir: android
+            targets: aarch64-linux-android
+            secret: ANDROID_KEYSTORE_BASE64
+          - name: android-tv
+            dir: android-tv
+            targets: aarch64-linux-android,armv7-linux-androideabi
+            secret: ANDROIDTV_KEYSTORE_BASE64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ${{ matrix.dir }}/android
+      - name: Restore the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets[matrix.secret] }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > ${{ matrix.dir }}/android/resumo.keystore
+          else
+            echo "::warning::Secret ${{ matrix.secret }} is not set: the APK is signed with a throwaway key and will not install over the previous version."
+          fi
+      - run: bash android/build-apk.sh
+        working-directory: ${{ matrix.dir }}
+      - run: rm -f ${{ matrix.dir }}/android/resumo.keystore
+        if: always()
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.dir }}/dist/*.apk
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'release'
+    needs: [windows, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach the files to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber --repo "${{ github.repository }}"
