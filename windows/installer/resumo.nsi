@@ -16,6 +16,9 @@ SetCompressor /SOLID lzma
 !ifndef VERSION
   !define VERSION "0.1.0"
 !endif
+!ifndef VI_VERSION
+  !define VI_VERSION "${VERSION}.0"
+!endif
 !ifndef SRC
   !error "Pass -DSRC=<folder with resumo.exe and libVLC>"
 !endif
@@ -38,7 +41,7 @@ InstallDirRegKey HKLM "${REGKEY}" "InstallDir"
 RequestExecutionLevel admin
 BrandingText "${APP} ${VERSION}"
 
-VIProductVersion "${VERSION}.0"
+VIProductVersion "${VI_VERSION}"
 VIAddVersionKey "ProductName" "${APP}"
 VIAddVersionKey "FileDescription" "${APP} Setup"
 VIAddVersionKey "FileVersion" "${VERSION}"
