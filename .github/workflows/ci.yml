@@ -20,7 +20,7 @@ jobs:
         crate: [windows, android, android-tv]
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libvlc-dev
+      - run: sudo apt-get update && sudo apt-get install -y libvlc-dev libvlccore-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
