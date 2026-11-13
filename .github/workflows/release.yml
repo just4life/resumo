@@ -7,8 +7,11 @@
 #   Resumo-android-arm64.apk        Android
 #   Resumo-androidtv.apk            Android TV (ARM 32 and 64 bit)
 #
-# It can also be run by hand (Actions -> Release builds -> Run workflow); the
-# files are then only kept as the run's artifacts.
+# The installer is named after the release tag (tag 1.0 -> Resumo-Setup-1.0.exe).
+#
+# It can also be run by hand (Actions -> Release builds -> Run workflow). With
+# a tag it builds the chosen branch and replaces that release's files with the
+# result; without one the files are only kept as the run's artifacts.
 #
 # APK signing: the keystores are not in the repository. Each one is stored as
 # a repository secret holding the base64 of the .keystore file:
@@ -22,6 +25,10 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to rebuild and replace the files of (empty = only build)
+        required: false
   pull_request:
     paths:
       - .github/workflows/release.yml
@@ -31,6 +38,8 @@ env:
   # libVLC for Windows (NuGet VideoLAN.LibVLC.Windows); Android takes its
   # libVLC version from build-apk.sh.
   VLC_WINDOWS_VERSION: 3.0.24
+  # The release being built, empty when there is none.
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
   windows:
@@ -58,7 +67,7 @@ jobs:
             unzip -q "$RUNNER_TEMP/libvlc.nupkg" 'build/x64/*' -d "$dir"
           fi
           echo "VLC_LIB_DIR=$dir/build/x64" >> "$GITHUB_ENV"
-      - run: sh installer/build-windows.sh
+      - run: VERSION="$TAG" sh installer/build-windows.sh
         working-directory: windows
       - uses: actions/upload-artifact@v4
         with:
@@ -111,7 +120,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: github.event_name == 'release'
+    if: github.event_name == 'release' || inputs.tag != ''
     needs: [windows, android]
     runs-on: ubuntu-24.04
     permissions:
@@ -124,4 +133,10 @@ jobs:
       - name: Attach the files to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber --repo "${{ github.repository }}"
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # An installer left from an earlier build under another version name.
+          for old in $(gh release view "$TAG" --json assets --jq '.assets[].name' | grep '^Resumo-Setup-'); do
+            [ -f "dist/$old" ] || gh release delete-asset "$TAG" "$old" --yes
+          done
+          gh release upload "$TAG" dist/* --clobber
