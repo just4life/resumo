@@ -26,7 +26,12 @@ import android.os.Looper;
 public final class Playback {
     public static final int PLAY = 1, PAUSE = 2, NEXT = 3, PREV = 4, SEEK = 5, STOP = 6, TOGGLE = 7;
 
-    static final String CHANNEL = "playback";
+    /**
+     * The notification channel. A channel's importance can't be changed once
+     * created, so raising it took a new id; the old one is deleted.
+     */
+    static final String CHANNEL = "playback_controls";
+    private static final String OLD_CHANNEL = "playback";
     static final int NOTIFICATION_ID = 1;
 
     /** Handled by the Rust side (registered from native code). */
@@ -49,12 +54,23 @@ public final class Playback {
             public void run() {
                 if (icon != null) art = BitmapFactory.decodeByteArray(icon, 0, icon.length);
                 if (Build.VERSION.SDK_INT >= 26) {
-                    NotificationChannel ch = new NotificationChannel(CHANNEL, "Воспроизведение", NotificationManager.IMPORTANCE_LOW);
+                    // Default importance, but silent: some skins (Vivo's
+                    // OriginOS / Funtouch among them) keep "low" (silent)
+                    // notifications, media ones included, off the lock screen.
+                    NotificationChannel ch = new NotificationChannel(CHANNEL, "Управление воспроизведением", NotificationManager.IMPORTANCE_DEFAULT);
+                    ch.setSound(null, null);
+                    ch.enableVibration(false);
+                    ch.enableLights(false);
                     ch.setShowBadge(false);
                     ch.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
-                    ((NotificationManager) app.getSystemService(Context.NOTIFICATION_SERVICE)).createNotificationChannel(ch);
+                    NotificationManager nm = (NotificationManager) app.getSystemService(Context.NOTIFICATION_SERVICE);
+                    nm.createNotificationChannel(ch);
+                    nm.deleteNotificationChannel(OLD_CHANNEL);
                 }
                 session = new MediaSession(app, "Resumo");
+                // Implied from Android 8 on; Android 7 (and lock screens that
+                // still look at them) need the flags to offer controls.
+                session.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
                 session.setCallback(new MediaSession.Callback() {
                     @Override public void onPlay() { action(PLAY, 0); }
                     @Override public void onPause() { action(PAUSE, 0); }
@@ -141,6 +157,9 @@ public final class Playback {
                 .setContentTitle(title)
                 .setContentText(subtitle)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setCategory(Notification.CATEGORY_TRANSPORT)
+                .setPriority(Notification.PRIORITY_DEFAULT)
+                .setOnlyAlertOnce(true)
                 .setOngoing(playing)
                 .setShowWhen(false)
                 .addAction(button(ctx, android.R.drawable.ic_media_previous, "Назад", PREV))
