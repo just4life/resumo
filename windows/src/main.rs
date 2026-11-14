@@ -9,12 +9,15 @@ mod crop;
 mod fit;
 mod hdr;
 mod hdr_gl;
+mod http;
 mod info;
+mod live;
 mod playlist;
 mod snapshot;
 mod store;
 mod taskbar;
 mod theme;
+mod twitch;
 mod video;
 mod vlc;
 

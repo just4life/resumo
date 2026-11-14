@@ -3,7 +3,7 @@
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{
@@ -14,6 +14,7 @@ use egui::{
 #[cfg(target_os = "android")]
 use crate::browser::{Browser, Purpose};
 use crate::crop::{self, Crop};
+use crate::live;
 #[cfg(target_os = "android")]
 use crate::history::History;
 #[cfg(target_os = "android")]
@@ -24,6 +25,7 @@ use crate::playlist::{self, Playlist, Repeat};
 use crate::store::Store;
 use crate::taskbar::{self, ThumbBar};
 use crate::theme::{self, Icon};
+use crate::twitch;
 use crate::video::VideoSink;
 use crate::vlc::{self, Instance, MediaPlayer};
 #[cfg(target_os = "android")]
@@ -34,6 +36,8 @@ use crate::zoom::{BarFinder, Output, ViewSettings, Zoom};
 #[path = "tv_app.rs"]
 mod tv_app;
 
+/// The "LIVE" mark of a stream being watched as it is broadcast.
+pub(crate) const LIVE_COLOR: Color32 = Color32::from_rgb(0xFF, 0x4D, 0x4D);
 const SPEEDS: &[f32] = &[0.25, 0.5, 0.75, 1.0, 1.15, 1.25, 1.5, 1.75, 2.0, 3.0];
 const HIDE_CONTROLS_AFTER: Duration = Duration::from_millis(2500);
 const SAVE_EVERY: Duration = Duration::from_secs(5);
@@ -112,6 +116,13 @@ pub struct PlayerApp {
     store: Store,
     /// Saved position to jump to once the new media starts playing.
     resume_at: Option<i64>,
+    /// Whether the current media is a live stream, and where in it we are.
+    pub(crate) live: live::Detector,
+    /// The clock the live stream's time is compared with.
+    clock: Instant,
+    /// A Twitch channel is about to play: its location in the playlist, and
+    /// where the address of its stream arrives from the thread asking Twitch.
+    resolving: Option<(String, mpsc::Receiver<Result<String, String>>)>,
     /// The current video played to its end: where the stopped player says
     /// it is must not be saved over that.
     ended: bool,
@@ -321,6 +332,9 @@ impl PlayerApp {
             status: None,
             store,
             resume_at: None,
+            live: live::Detector::default(),
+            clock: Instant::now(),
+            resolving: None,
             ended: false,
             last_save: Instant::now(),
             wheel_acc: 0.0,
@@ -380,6 +394,97 @@ impl PlayerApp {
     fn play_index(&mut self, index: usize) {
         let Some(item) = self.playlist.items.get(index) else { return };
         let location = item.location.clone();
+        self.resolving = None;
+        // A Twitch channel is a page, not a stream: ask Twitch where the
+        // stream is first, without holding up the screen meanwhile.
+        if let Some(channel) = twitch::channel(&location) {
+            self.remember_position();
+            self.player.stop();
+            self.events.reset();
+            self.sink.clear();
+            self.playlist.current = Some(index);
+            self.selected = Some(index);
+            self.seek_drag = None;
+            self.resume_at = None;
+            self.live = live::Detector::new(true);
+            let (tx, rx) = mpsc::channel();
+            let ctx = self.events.repaint.lock().unwrap().clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(twitch::resolve(&channel));
+                if let Some(ctx) = ctx {
+                    ctx.request_repaint();
+                }
+            });
+            self.resolving = Some((location, rx));
+            return;
+        }
+        self.live = live::Detector::new(false);
+        self.open_index(index, None);
+    }
+
+    /// Takes the answer about a Twitch channel's stream, once it is there.
+    fn poll_resolving(&mut self) {
+        let Some((location, rx)) = self.resolving.take() else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                self.resolving = Some((location, rx));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err("не удалось получить поток".to_owned()),
+        };
+        // The playlist may have changed while Twitch was answering.
+        let Some(index) = self.playlist.current.filter(|&i| self.playlist.items.get(i).is_some_and(|it| it.location == location))
+        else {
+            return;
+        };
+        match result {
+            Ok(address) => self.open_index(index, Some(&address)),
+            Err(e) => {
+                let name = self.current_title().unwrap_or_default();
+                self.stop();
+                self.notify(format!("Twitch, {name}: {e}"));
+            }
+        }
+    }
+
+    /// The current media is a live stream (or is going to be one).
+    pub(crate) fn is_live(&self) -> bool {
+        self.live.expects_live() || self.live.live().is_some()
+    }
+
+    /// Looks whether the current media turned out to be a live stream.
+    fn poll_live(&mut self) {
+        if !self.is_active() || self.resolving.is_some() || !self.player.is_playing() {
+            return;
+        }
+        let Some(location) = self.playlist.current.and_then(|i| self.playlist.items.get(i)).map(|it| it.location.clone()) else { return };
+        let was_live = self.live.live().is_some();
+        let network = ["http://", "https://", "rtsp://", "rtmp://", "udp://", "rtp://", "mms://"].iter().any(|s| location.starts_with(s));
+        self.live.update(network, self.clock.elapsed().as_millis() as i64, self.player.time(), self.player.length());
+        if !was_live && self.live.live().is_some() {
+            // What was taken for a video's length and position meant nothing.
+            self.store.forget(&location);
+            if let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get_mut(i)) {
+                item.duration = None;
+            }
+        }
+    }
+
+    /// Moves within a live stream to where `target` says, if it says so.
+    pub(crate) fn seek_live(&mut self, target: impl FnOnce(&mut live::Live, i64) -> Option<f32>) {
+        let clock = self.clock.elapsed().as_millis() as i64;
+        if let Some(position) = self.live.live_mut().and_then(|live| target(live, clock)) {
+            self.player.set_position(position);
+        }
+    }
+
+    /// Plays the playlist's entry `index`, from `address` if that is not the
+    /// entry's own location (a Twitch channel's stream).
+    fn open_index(&mut self, index: usize, address: Option<&str>) {
+        let Some(item) = self.playlist.items.get(index) else { return };
+        let location = item.location.clone();
+        let source = address.unwrap_or(&location).to_owned();
         #[cfg(target_os = "android")]
         let title = item.title.clone();
         self.remember_position();
@@ -409,10 +514,10 @@ impl PlayerApp {
             self.player.set_media_stream(crate::readahead::open(path), &options, &subtitles)
         } else {
             // A shared folder's server by its address (see `lan::by_address`).
-            self.player.set_media(&lan::by_address_waiting(&location), &options)
+            self.player.set_media(&lan::by_address_waiting(&source), &options)
         };
         #[cfg(not(target_os = "android"))]
-        let set = self.player.set_media(&location, &options);
+        let set = self.player.set_media(&source, &options);
         if let Err(e) = set {
             self.notify(format!("Не удалось открыть: {e}"));
             return;
@@ -429,7 +534,8 @@ impl PlayerApp {
         self.audio_delay_ms = 0;
         self.seek_drag = None;
         self.pending_subtitles.clear();
-        self.resume_at = self.store.position(&location);
+        // A live stream has nowhere to continue from.
+        self.resume_at = if self.live.expects_live() { None } else { self.store.position(&location) };
         #[cfg(target_os = "android")]
         if let Some(g) = &mut self.android.gpu {
             g.ensure_attached();
@@ -475,6 +581,9 @@ impl PlayerApp {
             }
             return;
         }
+        if self.resolving.is_some() {
+            return;
+        }
         let playing = self.player.is_playing();
         self.player.set_pause(playing);
     }
@@ -486,6 +595,8 @@ impl PlayerApp {
         self.events.reset();
         self.sink.clear();
         self.playlist.current = None;
+        self.resolving = None;
+        self.live = live::Detector::default();
         #[cfg(target_os = "android")]
         {
             self.android.probe = None;
@@ -504,7 +615,7 @@ impl PlayerApp {
 
     fn prev(&mut self) {
         // Like most players: restart the track unless we are near its start.
-        if self.is_active() && self.player.time() > 3000 {
+        if self.is_active() && !self.is_live() && self.player.time() > 3000 {
             self.player.set_time(0);
         } else if let Some(i) = self.playlist.prev_index() {
             self.play_index(i);
@@ -512,6 +623,16 @@ impl PlayerApp {
     }
 
     fn seek_by(&mut self, delta_ms: i64) {
+        if self.is_live() {
+            self.seek_live(|live, clock| live.seek_by(delta_ms, clock));
+            match self.live.live() {
+                Some(live) if !live.can_rewind() => self.notify("Этот эфир нельзя перематывать"),
+                Some(live) if live.is_at_edge() => self.notify("Прямой эфир"),
+                Some(live) => self.notify(format!("Эфир: {}", live::format_behind(live.behind()))),
+                None => {}
+            }
+            return;
+        }
         if self.is_active() && self.player.is_seekable() {
             let t = self.player.time() + delta_ms;
             let t = self.player.length().map_or(t, |l| t.min(l - 500));
@@ -526,6 +647,9 @@ impl PlayerApp {
         }
         let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get(i)) else { return };
         // Live streams have no length and cannot be resumed.
+        if self.is_live() {
+            return;
+        }
         if let (Some(len), true) = (self.player.length(), self.player.is_seekable()) {
             self.store.set_position(&item.location, self.player.time(), Some(len));
         }
@@ -862,6 +986,7 @@ impl PlayerApp {
     // ------------------------------------------------------------ per frame
 
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_resolving();
         if self.events.playing.swap(false, Ordering::SeqCst) {
             // The audio output exists only once playback started.
             self.player.set_volume(self.volume);
@@ -879,12 +1004,13 @@ impl PlayerApp {
                     self.notify(format!("Продолжаю с {}", format_time(ms)));
                 }
             }
-            if let (Some(i), Some(len)) = (self.playlist.current, self.player.length()) {
+            if let (Some(i), Some(len), false) = (self.playlist.current, self.player.length(), self.is_live()) {
                 if let Some(item) = self.playlist.items.get_mut(i) {
                     item.duration = Some(len);
                 }
             }
         }
+        self.poll_live();
         if self.events.error.swap(false, Ordering::SeqCst) {
             #[cfg(target_os = "android")]
             log::warn!("libVLC: playback error");
@@ -1156,8 +1282,17 @@ impl PlayerApp {
 
     /// Draws the seek bar and returns the bottom edge of its (unhovered) track.
     fn seek_bar(&mut self, ui: &mut Ui) -> f32 {
-        let length = self.player.length();
-        let pos = self.seek_drag.unwrap_or_else(|| if self.is_active() { self.player.position() } else { 0.0 });
+        let live = self.live.live().copied();
+        // A live stream's length is not one, and its bar is what can be rewound.
+        let length = if self.is_live() { None } else { self.player.length() };
+        let pos = self.seek_drag.unwrap_or_else(|| match live {
+            Some(live) => live.fraction(),
+            None if self.is_active() && !self.is_live() => self.player.position(),
+            None => 0.0,
+        });
+        let can_seek = self.is_active()
+            && self.player.is_seekable()
+            && if self.is_live() { live.is_some_and(|l| l.can_rewind()) } else { true };
         let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::click_and_drag());
         let hovered = resp.hovered() || resp.dragged();
         let track_h: f32 = if hovered { 16.0 } else { 12.0 };
@@ -1172,15 +1307,18 @@ impl PlayerApp {
             painter.rect_filled(Rect::from_min_max(track.min, pos2(p.x, track.max.y)), radius, Color32::from_white_alpha(40));
             if let Some(len) = length {
                 resp.clone().on_hover_text_at_pointer(format_time((len as f32 * at) as i64));
+            } else if let (Some(live), true) = (live, can_seek) {
+                resp.clone().on_hover_text_at_pointer(live_label(&live, Some(at)));
             }
         }
         let filled = Rect::from_min_max(track.min, pos2(track.min.x + track.width() * pos, track.max.y));
-        painter.rect_filled(filled, radius, theme::ACCENT);
-        if hovered || self.seek_drag.is_some() {
+        let at_edge = live.is_some_and(|l| l.is_at_edge()) && self.seek_drag.is_none();
+        painter.rect_filled(filled, radius, if at_edge { LIVE_COLOR } else { theme::ACCENT });
+        if (hovered && can_seek) || self.seek_drag.is_some() {
             painter.circle_filled(pos2(filled.max.x, track.center().y), 11.0, Color32::WHITE);
         }
 
-        if self.is_active() && self.player.is_seekable() {
+        if can_seek {
             if resp.dragged() || resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     self.seek_drag = Some(to_pos(p.x));
@@ -1188,8 +1326,10 @@ impl PlayerApp {
             }
             if resp.drag_stopped() || resp.clicked() {
                 let target = resp.interact_pointer_pos().map(|p| to_pos(p.x)).or(self.seek_drag);
-                if let Some(t) = target {
-                    self.player.set_position(t);
+                match target {
+                    Some(t) if live.is_some() => self.seek_live(|live, clock| live.seek_to(t, clock)),
+                    Some(t) => self.player.set_position(t),
+                    None => {}
                 }
                 self.seek_drag = None;
             }
@@ -1256,7 +1396,11 @@ impl PlayerApp {
         }
     }
 
-    fn time_label(&self, ui: &mut Ui) {
+    fn time_label(&mut self, ui: &mut Ui) {
+        if self.is_live() {
+            self.live_time(ui);
+            return;
+        }
         let time = if self.is_active() {
             let t = self
                 .seek_drag
@@ -1268,6 +1412,29 @@ impl PlayerApp {
             "--:-- / --:--".to_owned()
         };
         ui.label(RichText::new(time).font(FontId::monospace(11.5)).color(theme::TEXT_DIM));
+    }
+
+    /// What stands in place of the time for a live stream: "LIVE" with a red
+    /// dot, or how far behind it playback is; a tap on that returns to live.
+    fn live_time(&mut self, ui: &mut Ui) {
+        let live = self.live.live().copied();
+        let behind = live.filter(|l| !l.is_at_edge() || self.seek_drag.is_some());
+        let text = match behind {
+            Some(live) => live_label(&live, self.seek_drag),
+            None => "LIVE".to_owned(),
+        };
+        // Dim until the stream actually plays.
+        let color = if live.is_some() && behind.is_none() { LIVE_COLOR } else { theme::TEXT_DIM };
+        let (dot, _) = ui.allocate_exact_size(vec2(8.0, 8.0), Sense::hover());
+        ui.painter().circle_filled(dot.center(), 4.0, color);
+        let label = egui::Label::new(RichText::new(text).font(FontId::monospace(11.5)).color(theme::TEXT_DIM));
+        if behind.is_some() {
+            if ui.add(label.sense(Sense::click())).on_hover_text("Вернуться в прямой эфир").clicked() {
+                self.seek_live(|live, clock| live.seek_to(1.0, clock));
+            }
+        } else {
+            ui.add(label);
+        }
     }
 
     /// Fullscreen, playlist and open (laid out right to left).
@@ -1949,7 +2116,8 @@ impl PlayerApp {
         if !resp.dragged() {
             return;
         }
-        let seek_length = self.player.length().filter(|&l| l > 0 && self.is_active() && self.player.is_seekable());
+        let seek_length =
+            self.player.length().filter(|&l| l > 0 && self.is_active() && self.player.is_seekable() && !self.is_live());
         let now_ms = self.player.time();
         let volume_now = self.volume;
         let mut new_volume = None;
@@ -2336,6 +2504,19 @@ impl PlayerApp {
 /// Too narrow for one row of controls (a phone held upright).
 fn is_narrow(width: f32) -> bool {
     cfg!(target_os = "android") && width < 560.0
+}
+
+/// How far behind live a stream is, or would be at `fraction` of its seek bar.
+pub(crate) fn live_label(live: &live::Live, fraction: Option<f32>) -> String {
+    let behind = match fraction {
+        Some(f) => (live.depth() as f32 * (1.0 - f.clamp(0.0, 1.0))) as i64,
+        None => live.behind(),
+    };
+    if behind < 500 {
+        "LIVE".to_owned()
+    } else {
+        live::format_behind(behind)
+    }
 }
 
 fn track_name(t: &vlc::Track) -> String {

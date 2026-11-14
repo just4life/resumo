@@ -13,8 +13,12 @@ mod browser;
 mod crop;
 #[path = "../../src/history.rs"]
 mod history;
+#[path = "../../src/http.rs"]
+mod http;
 #[path = "../../src/lan.rs"]
 mod lan;
+#[path = "../../src/live.rs"]
+mod live;
 mod platform;
 #[path = "../../src/playlist.rs"]
 mod playlist;
@@ -25,6 +29,8 @@ mod surface;
 mod taskbar;
 #[path = "../../src/theme.rs"]
 mod theme;
+#[path = "../../src/twitch.rs"]
+mod twitch;
 #[path = "../../src/video.rs"]
 mod video;
 #[path = "../../src/vlc.rs"]

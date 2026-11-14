@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Stroke, Ui};
 
-use super::{format_time, track_name, trim_float, BarSearch, PlayerApp, SPEEDS};
+use super::{format_time, live_label, track_name, trim_float, BarSearch, PlayerApp, LIVE_COLOR, SPEEDS};
 use crate::browser::{Action, Browser, Outcome};
 use crate::crop;
 use crate::platform;
@@ -22,6 +22,8 @@ const BAR_FOR: Duration = Duration::from_secs(5);
 /// A seek made with ← / → is applied this long after the last press, so
 /// holding the button runs through the video without stopping on each step.
 const SEEK_SETTLE: Duration = Duration::from_millis(650);
+/// How far one press of ← or → moves in a live stream, milliseconds.
+const LIVE_STEP_MS: i64 = 5_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Button {
@@ -385,6 +387,13 @@ impl PlayerApp {
     /// ← / → or rewind / fast forward: moves the seek target; applied once
     /// the presses stop.
     fn tv_seek(&mut self, dir: i64, base_ms: i64, repeat: bool) {
+        // A live stream has only seconds to go back by: each press moves at once.
+        if self.is_live() {
+            self.android.tv.seek = None;
+            self.seek_by(dir * LIVE_STEP_MS);
+            self.tv_show_bar();
+            return;
+        }
         let Some(len) = self.player.length().filter(|_| self.player.is_seekable()) else {
             self.notify("Перемотка недоступна");
             return;
@@ -399,6 +408,9 @@ impl PlayerApp {
 
     /// Jumps to `tenths` of the video (0 is the start), as YouTube's digits do.
     fn tv_jump_to(&mut self, tenths: u8) {
+        if self.is_live() {
+            return;
+        }
         let Some(len) = self.player.length().filter(|_| self.player.is_seekable()) else { return };
         self.android.tv.seek = None;
         self.player.set_time(len * i64::from(tenths.min(9)) / 10);
@@ -878,7 +890,10 @@ impl PlayerApp {
         // Lighter than `dim`: it sits over the picture, not a dark panel.
         let soft = Color32::from_gray(220).gamma_multiply(alpha);
         let tv = &self.android.tv;
-        let length = self.player.length();
+        // A live stream has no length and no end to wait for.
+        let live = self.live.live().copied();
+        let is_live = self.is_live();
+        let length = if is_live { None } else { self.player.length() };
         let shown_ms = tv.seek.as_ref().map_or_else(|| self.player.time(), |s| s.target);
 
         // The clock, when the video ends, and where it is in the playlist.
@@ -916,22 +931,35 @@ impl PlayerApp {
         // Seek bar.
         let frac = match (tv.seek.as_ref(), length) {
             (Some(s), Some(l)) => s.target as f32 / l as f32,
+            _ if is_live => live.map_or(1.0, |l| l.fraction()),
             _ => self.player.position(),
         };
+        let at_edge = live.is_some_and(|l| l.is_at_edge());
         let y = screen.bottom() - 116.0;
         let track = Rect::from_min_max(pos2(screen.left() + 130.0, y - 4.0), pos2(screen.right() - 130.0, y + 4.0));
         let seek_focus = tv.bar_focus == BarFocus::Seek && tv.panel.is_none();
         let track = if seek_focus { track.expand2(vec2(0.0, 3.0)) } else { track };
         p.rect_filled(track, track.height() / 2.0, Color32::from_white_alpha((70.0 * alpha) as u8));
         let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * frac.clamp(0.0, 1.0), track.max.y));
-        p.rect_filled(fill, track.height() / 2.0, theme::ACCENT.gamma_multiply(alpha));
+        let fill_color = if at_edge { LIVE_COLOR } else { theme::ACCENT };
+        p.rect_filled(fill, track.height() / 2.0, fill_color.gamma_multiply(alpha));
         if seek_focus {
             p.circle_filled(pos2(fill.right(), track.center().y), 11.0, white);
             p.circle_stroke(pos2(fill.right(), track.center().y), 13.0, Stroke::new(2.0, theme::ACCENT.gamma_multiply(alpha)));
         }
         let time_font = FontId::monospace(17.0);
-        p.text(pos2(track.left() - 16.0, y), Align2::RIGHT_CENTER, format_time(shown_ms), time_font.clone(), white);
-        p.text(pos2(track.right() + 16.0, y), Align2::LEFT_CENTER, length.map_or("--:--".to_owned(), format_time), time_font, dim);
+        if is_live {
+            // How far behind the broadcast, then "LIVE" lit while watching it.
+            if let Some(l) = live.filter(|l| !l.is_at_edge()) {
+                p.text(pos2(track.left() - 16.0, y), Align2::RIGHT_CENTER, live_label(&l, None), time_font.clone(), white);
+            }
+            let mark = if at_edge { LIVE_COLOR.gamma_multiply(alpha) } else { dim };
+            p.circle_filled(pos2(track.right() + 22.0, y), 5.0, mark);
+            p.text(pos2(track.right() + 34.0, y), Align2::LEFT_CENTER, "LIVE", time_font, if at_edge { white } else { dim });
+        } else {
+            p.text(pos2(track.left() - 16.0, y), Align2::RIGHT_CENTER, format_time(shown_ms), time_font.clone(), white);
+            p.text(pos2(track.right() + 16.0, y), Align2::LEFT_CENTER, length.map_or("--:--".to_owned(), format_time), time_font, dim);
+        }
         if let Some(s) = &tv.seek {
             let d = s.target - self.player.time();
             let sign = if d < 0 { "−" } else { "+" };
