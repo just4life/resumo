@@ -181,6 +181,9 @@ pub struct PlayerApp {
     tab_pressed: bool,
     /// Size the window to the next video frame.
     fit_pending: bool,
+    /// Picture size (points) to keep when the window is refitted after the
+    /// playlist was shown or hidden; `None` fits the video at its own size.
+    fit_keep: Option<egui::Vec2>,
     /// Where the video was drawn last frame.
     video_rect: Rect,
     window_title: String,
@@ -289,6 +292,7 @@ impl PlayerApp {
             info: None,
             tab_pressed: false,
             fit_pending: false,
+            fit_keep: None,
             video_rect: Rect::NOTHING,
             window_title: String::new(),
             boosting: false,
@@ -328,6 +332,7 @@ impl PlayerApp {
         self.resume_quietly = false;
         self.info = None;
         self.fit_pending = true;
+        self.fit_keep = None;
         self.clip = None;
         self.clip_preview = None;
         self.hdr = None;
@@ -1182,7 +1187,7 @@ impl PlayerApp {
             self.cycle_crop();
         }
         if pressed(Key::L) {
-            self.show_playlist = !self.show_playlist;
+            self.toggle_playlist();
         }
         if pressed(Key::F) || pressed(Key::F11) {
             self.set_fullscreen(ctx, !self.fullscreen);
@@ -1344,9 +1349,25 @@ impl PlayerApp {
         if self.fullscreen || maximized {
             return;
         }
-        let (w, h) = self.frame_size;
-        let uv = self.crop.uv_rect(w, h);
-        fit::fit(frame, ctx, self.video_rect, vec2(uv.width() * w, uv.height() * h), MIN_WINDOW);
+        let video = match self.fit_keep.take() {
+            Some(picture) => picture * ctx.pixels_per_point(),
+            None => {
+                let (w, h) = self.frame_size;
+                let uv = self.crop.uv_rect(w, h);
+                vec2(uv.width() * w, uv.height() * h)
+            }
+        };
+        fit::fit(frame, ctx, self.video_rect, video, MIN_WINDOW);
+    }
+
+    /// Shows or hides the playlist and resizes the window by the panel's
+    /// width, so the picture keeps its size and no black bars appear beside it.
+    fn toggle_playlist(&mut self) {
+        self.show_playlist = !self.show_playlist;
+        if let Some(picture) = self.picture_rect() {
+            self.fit_keep = Some(picture.size());
+            self.fit_pending = true;
+        }
     }
 
     /// The Tab overlay in the top-left corner; returns its bottom edge.
@@ -1594,7 +1615,7 @@ impl PlayerApp {
                     if !self.fullscreen
                         && theme::icon_button(ui, Icon::Playlist, "Плейлист (L)", self.show_playlist).clicked()
                     {
-                        self.show_playlist = !self.show_playlist;
+                        self.toggle_playlist();
                     }
                     theme::menu_icon(ui, Icon::Folder, "Открыть", false, |ui| self.open_menu(ui));
                 });
@@ -2239,6 +2260,8 @@ impl PlayerApp {
         if submit && !url.trim().is_empty() {
             self.playlist.add_location(&url);
             self.play_index(self.playlist.items.len() - 1);
+            // A stream is for watching: give it the whole window.
+            self.show_playlist = false;
         } else if open && !ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.url_dialog = Some(url);
         }
