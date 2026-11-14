@@ -10,6 +10,7 @@ eframe = { version = "0.37", default-features = false, features = ["clipboard", 
 egui = "0.37"
 png = "0.18"
 rfd = "0.17"
+ureq = { version = "2.12", default-features = false, features = ["tls", "native-certs"] }
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
