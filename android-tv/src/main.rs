@@ -4,10 +4,13 @@
 
 mod app;
 mod crop;
+mod http;
+mod live;
 mod playlist;
 mod store;
 mod taskbar;
 mod theme;
+mod twitch;
 mod video;
 mod vlc;
 

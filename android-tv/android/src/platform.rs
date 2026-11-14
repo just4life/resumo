@@ -643,6 +643,56 @@ pub fn move_to_back() {
     });
 }
 
+/// One HTTP(S) request through Android's own client (`HttpURLConnection`),
+/// with the system's certificates and proxy: the status and the body as
+/// text. Blocks, so not for the UI thread.
+pub fn http_request(post: bool, url: &str, headers: &[(&str, &str)], body: Option<&str>) -> Result<(u16, String), String> {
+    const TIMEOUT_MS: i32 = 10_000;
+    const MAX_BODY: usize = 4 << 20;
+    with_env(|env, _| {
+        let spec = env.new_string(url)?;
+        let url = env.new_object("java/net/URL", "(Ljava/lang/String;)V", &[JValue::Object(&spec)])?;
+        let conn = env.call_method(&url, "openConnection", "()Ljava/net/URLConnection;", &[])?.l()?;
+        env.call_method(&conn, "setConnectTimeout", "(I)V", &[JValue::Int(TIMEOUT_MS)])?;
+        env.call_method(&conn, "setReadTimeout", "(I)V", &[JValue::Int(TIMEOUT_MS)])?;
+        for (name, value) in headers {
+            let (name, value) = (env.new_string(name)?, env.new_string(value)?);
+            let args = [JValue::Object(&name), JValue::Object(&value)];
+            env.call_method(&conn, "setRequestProperty", "(Ljava/lang/String;Ljava/lang/String;)V", &args)?;
+        }
+        if post {
+            let method = env.new_string("POST")?;
+            env.call_method(&conn, "setRequestMethod", "(Ljava/lang/String;)V", &[JValue::Object(&method)])?;
+            env.call_method(&conn, "setDoOutput", "(Z)V", &[JValue::Bool(1)])?;
+            let bytes = env.byte_array_from_slice(body.unwrap_or_default().as_bytes())?;
+            let out = env.call_method(&conn, "getOutputStream", "()Ljava/io/OutputStream;", &[])?.l()?;
+            env.call_method(&out, "write", "([B)V", &[JValue::Object(&bytes)])?;
+            env.call_method(&out, "close", "()V", &[])?;
+        }
+        let status = env.call_method(&conn, "getResponseCode", "()I", &[])?.i()?;
+        // The body of an error answer is a stream of its own.
+        let getter = if status >= 400 { "getErrorStream" } else { "getInputStream" };
+        let stream = env.call_method(&conn, getter, "()Ljava/io/InputStream;", &[])?.l()?;
+        let mut text = Vec::new();
+        if !stream.is_null() {
+            let buffer = env.new_byte_array(16 * 1024)?;
+            while text.len() < MAX_BODY {
+                let n = env.call_method(&stream, "read", "([B)I", &[JValue::Object(&buffer)])?.i()?;
+                if n < 0 {
+                    break;
+                }
+                let mut chunk = vec![0i8; n as usize];
+                env.get_byte_array_region(&buffer, 0, &mut chunk)?;
+                text.extend(chunk.into_iter().map(|b| b as u8));
+            }
+            env.call_method(&stream, "close", "()V", &[])?;
+        }
+        env.call_method(&conn, "disconnect", "()V", &[])?;
+        Ok((status as u16, String::from_utf8_lossy(&text).into_owned()))
+    })
+    .ok_or_else(|| "нет соединения".to_owned())
+}
+
 pub fn clipboard_text() -> Option<String> {
     with_env(|env, activity| {
         let name = env.new_string("clipboard")?;
