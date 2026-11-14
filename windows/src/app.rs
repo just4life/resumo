@@ -11,6 +11,7 @@ use egui::{
     TextureHandle, TextureOptions, Ui, UiBuilder,
 };
 
+use crate::clip::{self, Marks};
 use crate::crop::{self, Crop};
 use crate::hdr::{self, HdrInfo, Transfer};
 use crate::hdr_gl;
@@ -44,6 +45,12 @@ const HOLD_DELAY: f64 = 0.35;
 const HOLD_RATE: f32 = 2.0;
 /// Moving further than this (points) while holding moves the window instead.
 const HOLD_SLOP: f32 = 6.0;
+/// How opaque the right-click menu over the video is.
+const MENU_OPACITY: f32 = 0.86;
+/// How long the clip bar says where a saved clip went.
+const CLIP_SAVED_SHOWN: Duration = Duration::from_secs(8);
+/// Colour of the clip marks on the seek bar.
+const CLIP_COLOR: Color32 = Color32::from_rgb(0xFF, 0xC2, 0x3D);
 /// How far Shift + drag may move subtitles, as a share of the picture height.
 const SUB_LIFT_MAX_UP: f32 = 0.9;
 const SUB_LIFT_MAX_DOWN: f32 = 0.2;
@@ -94,7 +101,7 @@ pub struct PlayerApp {
     // Field order matters: the player must be dropped before the sink and the
     // event flags it holds raw pointers to.
     player: MediaPlayer,
-    _instance: Instance,
+    instance: Instance,
     sink: Arc<VideoSink>,
     events: Arc<Events>,
 
@@ -174,6 +181,17 @@ pub struct PlayerApp {
     boosting: bool,
     /// The current press on the video turned into moving the window.
     hold_dragged: bool,
+
+    /// The piece of the current video marked for saving as a clip.
+    clip: Option<Marks>,
+    /// The marked piece is being played once to check it; true once the
+    /// player has got to it (a seek takes a moment to show in its time).
+    clip_preview: Option<bool>,
+    /// The clip being written.
+    clip_export: Option<clip::Export>,
+    last_clip: Option<PathBuf>,
+    /// When the last clip was saved, to say so in the clip bar for a while.
+    clip_saved: Option<Instant>,
 }
 
 impl PlayerApp {
@@ -208,7 +226,7 @@ impl PlayerApp {
         let (saved_tx, saved_rx) = mpsc::channel();
         let mut app = Self {
             player,
-            _instance: instance,
+            instance,
             sink,
             events,
             texture: None,
@@ -259,6 +277,11 @@ impl PlayerApp {
             window_title: String::new(),
             boosting: false,
             hold_dragged: false,
+            clip: None,
+            clip_preview: None,
+            clip_export: None,
+            last_clip: None,
+            clip_saved: None,
         };
         app.player.set_subtitle_scale(app.subtitle_scale);
         app.add_paths(files, true);
@@ -298,6 +321,8 @@ impl PlayerApp {
         self.resume_quietly = false;
         self.info = None;
         self.fit_pending = true;
+        self.clip = None;
+        self.clip_preview = None;
         if !self.player.play() {
             self.notify("Не удалось начать воспроизведение");
         }
@@ -307,9 +332,11 @@ impl PlayerApp {
     fn reload_current(&mut self) {
         let Some(i) = self.playlist.current else { return };
         let t = self.player.time();
+        let clip = self.clip;
         self.play_index(i);
-        // Same video: keep the window as the user left it.
+        // Same video: keep the window and the clip marks as the user left them.
         self.fit_pending = false;
+        self.clip = clip;
         if t > 0 {
             self.resume_at = Some(t);
             self.resume_quietly = true;
@@ -407,13 +434,7 @@ impl PlayerApp {
         while let Ok(result) = self.saved_rx.try_recv() {
             match result {
                 Ok(path) => {
-                    // "Pictures\Resumo": enough to find it, short enough for the OSD.
-                    let dir = path.parent().unwrap_or(&path);
-                    let folder = match (dir.parent().and_then(Path::file_name), dir.file_name()) {
-                        (Some(parent), Some(name)) => Path::new(parent).join(name),
-                        _ => dir.to_path_buf(),
-                    };
-                    self.notify(format!("Кадр сохранён в {}", folder.display()));
+                    self.notify(format!("Кадр сохранён в {}", short_folder(&path).display()));
                     self.last_saved = Some(path);
                 }
                 Err(e) => self.notify(format!("Не удалось сохранить кадр: {e}")),
@@ -445,6 +466,13 @@ impl PlayerApp {
         }
         let playing = self.player.is_playing();
         self.player.set_pause(playing);
+        self.clip_preview = None;
+        // Pausing ends a clip that has no end yet.
+        if let (true, Some(marks)) = (playing, &mut self.clip) {
+            if marks.end.is_none() {
+                marks.set_end(self.player.time());
+            }
+        }
     }
 
     fn stop(&mut self) {
@@ -454,6 +482,239 @@ impl PlayerApp {
         self.events.reset();
         self.sink.clear();
         self.playlist.current = None;
+        self.clip = None;
+        self.clip_preview = None;
+    }
+
+    // ------------------------------------------------------------------ clips
+
+    /// Starts a clip at the current position, or moves the start of the one
+    /// being marked.
+    fn mark_clip_start(&mut self) {
+        if !self.is_active() || !self.player.is_seekable() || self.player.length().is_none() {
+            self.notify("Клип можно вырезать только из видео с перемоткой");
+            return;
+        }
+        let t = self.player.time();
+        self.clip_preview = None;
+        self.clip_saved = None;
+        match &mut self.clip {
+            Some(marks) => marks.set_start(t),
+            None => self.clip = Some(Marks::new(t)),
+        }
+        let hint = if self.player.is_playing() { "поставьте на паузу в конце" } else { "включите и поставьте на паузу в конце" };
+        self.notify(format!("Начало клипа: {}, {hint}", format_time(t)));
+    }
+
+    fn mark_clip_end(&mut self) {
+        let t = self.player.time();
+        let Some(marks) = &mut self.clip else {
+            self.notify("Сначала отметьте начало клипа (I)");
+            return;
+        };
+        self.clip_preview = None;
+        if marks.set_end(t) {
+            self.notify(format!("Конец клипа: {}", format_time(t)));
+        } else {
+            self.notify("Конец клипа должен быть после начала");
+        }
+    }
+
+    fn cancel_clip(&mut self) {
+        self.clip = None;
+        self.clip_preview = None;
+        self.clip_export = None;
+    }
+
+    /// Plays the marked piece once and pauses at its end.
+    fn preview_clip(&mut self) {
+        let Some((start, _)) = self.clip.and_then(|m| m.range(self.player.time())) else { return };
+        // The end no longer follows the video once it jumps back to the start.
+        if let Some(marks) = &mut self.clip {
+            marks.set_end(self.player.time());
+        }
+        self.player.set_time(start);
+        self.player.set_pause(false);
+        self.clip_preview = Some(false);
+    }
+
+    /// Writes the marked piece into `Videos/Resumo`, in the background.
+    fn save_clip(&mut self) {
+        let now = self.player.time();
+        let Some((start, end)) = self.clip.and_then(|m| m.range(now)) else {
+            self.notify("Отметьте конец клипа: поставьте на паузу или нажмите O");
+            return;
+        };
+        let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get(i)) else { return };
+        if self.player.is_playing() {
+            self.player.set_pause(true);
+        }
+        self.clip_preview = None;
+        self.clip = Some(Marks { start, end: Some(end) });
+        let info = self.player.media_info();
+        let job = clip::Job {
+            source: item.location.clone(),
+            mp4_source: clip::is_mp4(&item.location),
+            start,
+            end,
+            audio_track: self.player.audio_track(),
+            dir: clip::folder(),
+            stem: clip::file_stem(&item.title, start, end),
+            containers: clip::containers(
+                info.video.as_ref().map(|v| v.fourcc.as_str()),
+                info.audio.as_ref().map(|a| a.fourcc.as_str()),
+            ),
+        };
+        match clip::Export::start(&self.instance, job) {
+            Ok(export) => self.clip_export = Some(export),
+            Err(e) => self.notify(format!("Не удалось сохранить клип: {e}")),
+        }
+    }
+
+    fn poll_clip(&mut self, ctx: &egui::Context) {
+        if let Some(seen) = self.clip_preview {
+            let now = self.player.time();
+            match self.clip.and_then(|m| m.end.map(|end| (m.start, end))) {
+                Some((start, end)) if seen && now >= end => {
+                    self.player.set_pause(true);
+                    self.clip_preview = None;
+                    self.notify(format!("Клип: {} – {}", format_time(start), format_time(end)));
+                }
+                Some((_, end)) => self.clip_preview = Some(seen || now < end),
+                None => self.clip_preview = None,
+            }
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
+        let Some(export) = &mut self.clip_export else { return };
+        match export.poll(&self.instance) {
+            clip::Status::Running => ctx.request_repaint_after(Duration::from_millis(100)),
+            clip::Status::Done(path) => {
+                self.clip_export = None;
+                self.clip = None;
+                self.last_clip = Some(path);
+                self.clip_saved = Some(Instant::now());
+            }
+            clip::Status::Failed(e) => {
+                self.clip_export = None;
+                self.notify(format!("Не удалось сохранить клип: {e}"));
+            }
+        }
+    }
+
+    fn open_clips_folder(&mut self) {
+        match &self.last_clip {
+            Some(path) if path.exists() => snapshot::reveal(path),
+            _ => {
+                let dir = clip::folder();
+                let _ = std::fs::create_dir_all(&dir);
+                snapshot::reveal(&dir);
+            }
+        }
+    }
+
+    /// The clip bar above the controls: the marked piece, buttons to adjust,
+    /// check and save it, and the progress while it is written.
+    fn clip_panel(&mut self, ui: &mut Ui, ctx: &egui::Context, rect: Rect) {
+        let row = Rect::from_min_max(
+            pos2(rect.left() + 14.0, rect.bottom() - 78.0 - 44.0),
+            pos2(rect.right() - 14.0, rect.bottom() - 78.0 - 6.0),
+        );
+        // Darker than the control capsules: it lies over subtitles.
+        let frame = egui::Frame::new()
+            .fill(Color32::from_black_alpha(215))
+            .corner_radius(CornerRadius::same(19))
+            .inner_margin(Margin::same(4));
+        let flat = |text: &str| egui::Button::new(RichText::new(text).color(theme::TEXT)).frame_when_inactive(false);
+        let Some(marks) = self.clip else {
+            // Nothing is being marked: say where the last clip went, for a while.
+            let Some(path) = self.last_clip.clone().filter(|_| self.clip_saved.is_some_and(|t| t.elapsed() < CLIP_SAVED_SHOWN))
+            else {
+                self.clip_saved = None;
+                return;
+            };
+            ctx.request_repaint_after(Duration::from_millis(500));
+            ui.scope_builder(UiBuilder::new().max_rect(row).layout(Layout::left_to_right(Align::Center)), |ui| {
+                frame.show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.set_min_height(30.0);
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Клип сохранён").strong().color(CLIP_COLOR));
+                    ui.label(RichText::new(format!("в {}", short_folder(&path).display())).color(theme::TEXT));
+                    if ui.add(flat("Показать в папке")).clicked() {
+                        snapshot::reveal(&path);
+                        self.clip_saved = None;
+                    }
+                    if theme::icon_button(ui, Icon::Close, "Закрыть", false).clicked() {
+                        self.clip_saved = None;
+                    }
+                });
+            });
+            return;
+        };
+        let now = self.player.time();
+        let range = marks.range(now);
+        let mut action = None;
+        ui.scope_builder(UiBuilder::new().max_rect(row).layout(Layout::left_to_right(Align::Center)), |ui| {
+            frame.show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.set_min_height(30.0);
+                ui.add_space(10.0);
+                ui.label(RichText::new("Клип").strong().color(CLIP_COLOR));
+                let times = match range {
+                    Some((start, end)) => {
+                        format!("{} – {}, {}", format_time(start), format_time(end), format_length(end - start))
+                    }
+                    None => format!("{} – …", format_time(marks.start)),
+                };
+                ui.label(RichText::new(times).color(theme::TEXT));
+                if let Some(export) = &self.clip_export {
+                    ui.add(egui::Spinner::new().size(14.0));
+                    let percent = (export.progress() * 100.0).round();
+                    ui.label(RichText::new(format!("Сохраняю… {percent} %")).color(theme::TEXT_DIM));
+                    if ui.button("Отмена").clicked() {
+                        action = Some(ClipAction::Cancel);
+                    }
+                    ui.add_space(4.0);
+                    return;
+                }
+                if marks.end.is_none() {
+                    let hint = if self.player.is_playing() { "пауза в конце клипа" } else { "включите видео" };
+                    ui.label(RichText::new(hint).color(theme::TEXT_DIM));
+                }
+                if ui.add(flat("Начало")).on_hover_text("Начать клип с этого места (I)").clicked() {
+                    action = Some(ClipAction::Start);
+                }
+                if ui.add(flat("Конец")).on_hover_text("Закончить клип на этом месте (O)").clicked() {
+                    action = Some(ClipAction::End);
+                }
+                if ui
+                    .add_enabled(range.is_some(), flat("Просмотр"))
+                    .on_hover_text("Проиграть клип от начала до конца")
+                    .clicked()
+                {
+                    action = Some(ClipAction::Preview);
+                }
+                if ui
+                    .add_enabled_ui(range.is_some(), |ui| theme::pill(ui, None, "Сохранить"))
+                    .inner
+                    .on_hover_text("Сохранить клип в папку «Видео\\Resumo» без перекодирования")
+                    .clicked()
+                {
+                    action = Some(ClipAction::Save);
+                }
+                if theme::icon_button(ui, Icon::Close, "Отменить клип (Esc)", false).clicked() {
+                    action = Some(ClipAction::Cancel);
+                }
+            });
+        });
+        match action {
+            Some(ClipAction::Start) => self.mark_clip_start(),
+            Some(ClipAction::End) => self.mark_clip_end(),
+            Some(ClipAction::Preview) => self.preview_clip(),
+            Some(ClipAction::Save) => self.save_clip(),
+            Some(ClipAction::Cancel) => self.cancel_clip(),
+            None => {}
+        }
     }
 
     fn next(&mut self, auto: bool) {
@@ -698,6 +959,7 @@ impl PlayerApp {
         }
         self.apply_subtitle_margin();
         self.poll_saved_frames(ctx);
+        self.poll_clip(ctx);
         if self.hdr_wait.is_some_and(|t| t.elapsed() >= HDR_FRAME_TIMEOUT) && self.player.is_playing() {
             self.hdr_wait = None;
             if let Some(item) = self.playlist.current.and_then(|i| self.playlist.items.get(i)) {
@@ -793,8 +1055,18 @@ impl PlayerApp {
         if pressed(Key::F) || pressed(Key::F11) {
             self.set_fullscreen(ctx, !self.fullscreen);
         }
-        if pressed(Key::Escape) && self.fullscreen {
-            self.set_fullscreen(ctx, false);
+        if pressed(Key::Escape) {
+            if self.fullscreen {
+                self.set_fullscreen(ctx, false);
+            } else if self.clip.is_some() {
+                self.cancel_clip();
+            }
+        }
+        if pressed(Key::I) && self.clip_export.is_none() {
+            self.mark_clip_start();
+        }
+        if pressed(Key::O) && !ctrl && self.clip_export.is_none() {
+            self.mark_clip_end();
         }
         if ctrl && pressed(Key::O) {
             self.open_files_dialog(true);
@@ -1085,6 +1357,17 @@ impl PlayerApp {
         }
         let filled = Rect::from_min_max(track.min, pos2(track.min.x + track.width() * pos, track.max.y));
         painter.rect_filled(filled, radius, theme::ACCENT);
+        // The piece marked for a clip: a band with a tick at each end.
+        if let (Some(marks), Some(len)) = (self.clip, length) {
+            let x = |ms: i64| track.min.x + track.width() * (ms as f32 / len as f32).clamp(0.0, 1.0);
+            let tick = |x: f32| Rect::from_center_size(pos2(x, track.center().y), vec2(3.0, track_h + 8.0));
+            if let Some((start, end)) = marks.range(self.player.time()) {
+                let band = Rect::from_min_max(pos2(x(start), track.min.y), pos2(x(end), track.max.y));
+                painter.rect_filled(band, 0.0, CLIP_COLOR.gamma_multiply(0.45));
+                painter.rect_filled(tick(x(end)), 1.5, CLIP_COLOR);
+            }
+            painter.rect_filled(tick(x(marks.start)), 1.5, CLIP_COLOR);
+        }
         if hovered || self.seek_drag.is_some() {
             painter.circle_filled(pos2(filled.max.x, track.center().y), 11.0, Color32::WHITE);
         }
@@ -1611,6 +1894,10 @@ impl PlayerApp {
             self.toggle_pause();
         }
         self.hold_on_video(ctx, &resp);
+        // The right-click menu and its submenus are slightly see-through.
+        // Menus take their background from the global style when shown.
+        let solid = ctx.global_style().visuals.window_fill;
+        ctx.global_style_mut(|s| s.visuals.window_fill = solid.gamma_multiply(MENU_OPACITY));
         resp.context_menu(|ui| {
             ui.set_min_width(200.0);
             ui.menu_button("Аудиодорожка", |ui| self.audio_menu(ui));
@@ -1636,6 +1923,20 @@ impl PlayerApp {
                 ui.close();
                 self.open_frames_folder();
             }
+            if self.clip.is_none() {
+                let can = self.is_active() && self.player.is_seekable();
+                if ui.add_enabled(can, egui::Button::new("Сделать клип").shortcut_text("I")).clicked() {
+                    ui.close();
+                    self.mark_clip_start();
+                }
+            } else if ui.button("Отменить клип").clicked() {
+                ui.close();
+                self.cancel_clip();
+            }
+            if ui.button("Папка с клипами").clicked() {
+                ui.close();
+                self.open_clips_folder();
+            }
             let info = if self.show_info { "Скрыть информацию" } else { "Информация о видео" };
             if ui.add_enabled(self.is_active(), egui::Button::new(info).shortcut_text("Tab")).clicked() {
                 ui.close();
@@ -1655,8 +1956,10 @@ impl PlayerApp {
                 self.set_fullscreen(ctx, !self.fullscreen);
             }
         });
+        ctx.global_style_mut(|s| s.visuals.window_fill = solid);
 
         self.overlay_controls(ui, ctx, rect);
+        self.clip_panel(ui, ctx, rect);
         let info_bottom = self.info_overlay(ui, ctx, rect);
         self.boost_badge(ui, rect);
 
@@ -1818,6 +2121,34 @@ impl eframe::App for PlayerApp {
         }
         self.url_window(&ctx);
         self.resize_edges(&ctx);
+    }
+}
+
+enum ClipAction {
+    Start,
+    End,
+    Preview,
+    Save,
+    Cancel,
+}
+
+/// "Pictures\Resumo" for a file saved there: enough to find it, short
+/// enough for the on-screen message.
+fn short_folder(file: &Path) -> PathBuf {
+    let dir = file.parent().unwrap_or(file);
+    match (dir.parent().and_then(Path::file_name), dir.file_name()) {
+        (Some(parent), Some(name)) => Path::new(parent).join(name),
+        _ => dir.to_path_buf(),
+    }
+}
+
+/// "12 с", "1 мин 05 с": how long a clip is.
+fn format_length(ms: i64) -> String {
+    let s = (ms.max(0) + 500) / 1000;
+    if s < 60 {
+        format!("{s} с")
+    } else {
+        format!("{} мин {:02} с", s / 60, s % 60)
     }
 }
 
