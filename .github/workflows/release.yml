@@ -8,6 +8,8 @@
 #   Resumo-androidtv.apk            Android TV (ARM 32 and 64 bit)
 #
 # The installer is named after the release tag (tag 1.0 -> Resumo-Setup-1.0.exe).
+# The APKs take their version from it too: tag 1.2.1 -> versionName 1.2.1,
+# versionCode 10201 (major*10000 + minor*100 + patch).
 #
 # It can also be run by hand (Actions -> Release builds -> Run workflow). With
 # a tag it builds the chosen branch and replaces that release's files with the
@@ -109,7 +111,8 @@ jobs:
           else
             echo "::warning::Secret ${{ matrix.secret }} is not set: the APK is signed with a throwaway key and will not install over the previous version."
           fi
-      - run: bash android/build-apk.sh
+      # The APK's version (versionName, versionCode) comes from the tag.
+      - run: VERSION="$TAG" bash android/build-apk.sh
         working-directory: ${{ matrix.dir }}
       - run: rm -f ${{ matrix.dir }}/android/resumo.keystore
         if: always()
