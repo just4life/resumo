@@ -145,6 +145,8 @@ enum PanelRow {
     Shuffle,
     Item(usize),
     AddFiles,
+    AddFolder,
+    AddLink,
     Save,
     Clear,
 }
@@ -582,6 +584,8 @@ impl PlayerApp {
                 rows.extend((0..self.playlist.items.len()).map(PanelRow::Item));
                 rows.push(PanelRow::Header("Действия"));
                 rows.push(PanelRow::AddFiles);
+                rows.push(PanelRow::AddFolder);
+                rows.push(PanelRow::AddLink);
                 rows.push(PanelRow::Save);
                 rows.push(PanelRow::Clear);
             }
@@ -661,6 +665,14 @@ impl PlayerApp {
             PanelRow::AddFiles => {
                 self.close_panel();
                 self.open_files_dialog(false);
+            }
+            PanelRow::AddFolder => {
+                self.close_panel();
+                self.open_folder_dialog();
+            }
+            PanelRow::AddLink => {
+                self.close_panel();
+                self.url_dialog = Some(String::new());
             }
             PanelRow::Save => {
                 self.close_panel();
@@ -1050,6 +1062,8 @@ impl PlayerApp {
                 tv::row(p, r, icon, &item.title, trail, focused, current)
             }
             PanelRow::AddFiles => tv::row(p, r, Some((Icon::Plus, theme::ACCENT)), "Добавить файлы", Trail::None, focused, false),
+            PanelRow::AddFolder => tv::row(p, r, Some((Icon::Folder, theme::ACCENT)), "Добавить папку", Trail::None, focused, false),
+            PanelRow::AddLink => tv::row(p, r, Some((Icon::Link, theme::ACCENT)), "Добавить ссылку", Trail::None, focused, false),
             PanelRow::Save => tv::row(p, r, Some((Icon::Playlist, theme::ACCENT)), "Сохранить как M3U", Trail::None, focused, false),
             PanelRow::Clear => tv::row(p, r, Some((Icon::Close, theme::TEXT_DIM)), "Очистить плейлист", Trail::None, focused, false),
         }

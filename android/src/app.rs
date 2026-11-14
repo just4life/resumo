@@ -1810,6 +1810,14 @@ impl PlayerApp {
                 if theme::pill(ui, Some(Icon::Plus), "Добавить файлы").clicked() {
                     self.open_files_dialog(false);
                 }
+                ui.add_space(6.0);
+                if theme::pill_secondary(ui, Some(Icon::Folder), "Добавить папку").clicked() {
+                    self.open_folder_dialog();
+                }
+                ui.add_space(6.0);
+                if theme::pill_secondary(ui, Some(Icon::Link), "Добавить ссылку").clicked() {
+                    self.url_dialog = Some(String::new());
+                }
             });
             #[cfg(target_os = "android")]
             self.recent_in_panel(ui);
