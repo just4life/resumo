@@ -20,6 +20,7 @@ use crate::info;
 use crate::playlist::{self, Playlist, Repeat};
 use crate::snapshot::{self, Image};
 use crate::store::Store;
+use crate::awake::{self, KeepAwake};
 use crate::taskbar::{self, ThumbBar};
 use crate::theme::{self, Icon};
 use crate::video::{PixelFormat, VideoSink};
@@ -160,6 +161,8 @@ pub struct PlayerApp {
     wheel_acc: f32,
     icon: Option<TextureHandle>,
     thumb_bar: ThumbBar,
+    /// Keeps the screen on while a video plays.
+    keep_awake: KeepAwake,
 
     capture: Option<PendingCapture>,
     /// Results of saving frames, from the background writer.
@@ -265,6 +268,7 @@ impl PlayerApp {
             wheel_acc: 0.0,
             icon,
             thumb_bar: ThumbBar::default(),
+            keep_awake: KeepAwake::default(),
             capture: None,
             saved_tx,
             saved_rx,
@@ -2098,6 +2102,11 @@ impl eframe::App for PlayerApp {
             Some(taskbar::Action::Next) => self.next(false),
             None => {}
         }
+        self.keep_awake.set(match (self.player.is_playing(), self.has_picture()) {
+            (false, _) => awake::Need::Nothing,
+            (true, false) => awake::Need::System,
+            (true, true) => awake::Need::Display,
+        });
 
         if !self.fullscreen {
             egui::Panel::top("title_bar")
