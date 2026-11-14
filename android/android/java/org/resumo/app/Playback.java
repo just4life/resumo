@@ -9,6 +9,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioManager;
 import android.media.MediaMetadata;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
@@ -44,6 +47,26 @@ public final class Playback {
     private static String title = "", subtitle = "";
     private static boolean playing, active;
     private static Handler main;
+    private static AudioManager audio;
+    private static AudioFocusRequest focusRequest;
+    private static boolean hasFocus;
+    private static final AudioAttributes ATTRS = new AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+            .build();
+
+    /**
+     * Another app took the sound (a call, music, a video): pause, like other
+     * players. Focus is asked for again on the next play.
+     */
+    private static final AudioManager.OnAudioFocusChangeListener FOCUS = new AudioManager.OnAudioFocusChangeListener() {
+        public void onAudioFocusChange(int change) {
+            if (change == AudioManager.AUDIOFOCUS_LOSS || change == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+                hasFocus = false;
+                if (playing) action(PAUSE, 0);
+            }
+        }
+    };
 
     /** Once, with the activity; `icon` is the app's PNG icon. */
     public static void init(final Activity activity, final byte[] icon) {
@@ -67,7 +90,17 @@ public final class Playback {
                     nm.createNotificationChannel(ch);
                     nm.deleteNotificationChannel(OLD_CHANNEL);
                 }
+                audio = (AudioManager) app.getSystemService(Context.AUDIO_SERVICE);
+                if (Build.VERSION.SDK_INT >= 26) {
+                    focusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                            .setAudioAttributes(ATTRS)
+                            .setOnAudioFocusChangeListener(FOCUS, main)
+                            .build();
+                }
                 session = new MediaSession(app, "Resumo");
+                // The lock screen shows the session of the app that plays and
+                // holds the audio focus (like Spotify); say it is local media.
+                session.setPlaybackToLocal(ATTRS);
                 // Implied from Android 8 on; Android 7 (and lock screens that
                 // still look at them) need the flags to offer controls.
                 session.setFlags(MediaSession.FLAG_HANDLES_MEDIA_BUTTONS | MediaSession.FLAG_HANDLES_TRANSPORT_CONTROLS);
@@ -103,6 +136,7 @@ public final class Playback {
                         active = false;
                         playing = false;
                         session.setActive(false);
+                        abandonFocus();
                         app.stopService(new Intent(app, PlaybackService.class));
                     }
                     return;
@@ -128,6 +162,7 @@ public final class Playback {
                         .setState(isPlaying ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED, position,
                                 isPlaying ? rate : 0f)
                         .build());
+                if (isPlaying && !hasFocus) requestFocus();
                 if (!active) {
                     active = true;
                     session.setActive(true);
@@ -145,6 +180,20 @@ public final class Playback {
                 }
             }
         });
+    }
+
+    private static void requestFocus() {
+        if (audio == null) return;
+        int r = Build.VERSION.SDK_INT >= 26 ? audio.requestAudioFocus(focusRequest)
+                : audio.requestAudioFocus(FOCUS, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
+        hasFocus = r == AudioManager.AUDIOFOCUS_REQUEST_GRANTED;
+    }
+
+    private static void abandonFocus() {
+        if (audio == null || !hasFocus) return;
+        if (Build.VERSION.SDK_INT >= 26) audio.abandonAudioFocusRequest(focusRequest);
+        else audio.abandonAudioFocus(FOCUS);
+        hasFocus = false;
     }
 
     static boolean isPlaying() {
