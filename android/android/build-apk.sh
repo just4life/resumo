@@ -7,6 +7,9 @@
 #   ANDROID_HOME        SDK folder               (default /opt/android/sdk)
 #   ANDROID_NDK_HOME    NDK folder               (default: newest in $ANDROID_HOME/ndk)
 #   VLC_AAR             libvlc-all .aar file     (default: downloaded from Maven Central)
+#   VERSION             app version, e.g. a release tag "1.2.1" or "v1.2.1"
+#                       (default: versionName/versionCode from AndroidManifest.xml).
+#                       versionCode becomes major*10000 + minor*100 + patch.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -18,6 +21,22 @@ ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | 
 BUILD_TOOLS="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
 PLATFORM_JAR="$(ls -d "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -1)"
 API=24
+
+# --- Version -------------------------------------------------------------------
+version_args=()
+VERSION="${VERSION:-}"
+VERSION="${VERSION#v}"
+if [ -n "$VERSION" ]; then
+    # "1.2.1" -> 10201, "1.2" -> 10200, "2.0-beta" -> 20000.
+    version_code="$(echo "$VERSION" | sed 's/[^0-9.].*//' |
+        awk -F. '{ printf "%d", ($1 + 0) * 10000 + ($2 + 0) * 100 + ($3 + 0) }')"
+    if [ "$version_code" -le 0 ]; then
+        echo "VERSION=$VERSION does not start with a number" >&2
+        exit 1
+    fi
+    version_args=(--replace-version --version-name "$VERSION" --version-code "$version_code")
+    echo "Version $VERSION (versionCode $version_code)"
+fi
 ABI="${ABI:-arm64-v8a}"
 case "$ABI" in
     arm64-v8a) triple=aarch64-linux-android; suffix=arm64 ;;
@@ -75,7 +94,8 @@ javac -nowarn -source 8 -target 8 -bootclasspath "$PLATFORM_JAR" -d "$javac_out"
 cp "$javac_out/classes.dex" "$stage/classes2.dex"
 
 "$BUILD_TOOLS/aapt2" compile --dir res -o "$stage/res.zip"
-"$BUILD_TOOLS/aapt2" link -o "$stage/base.apk" -I "$PLATFORM_JAR" --manifest AndroidManifest.xml "$stage/res.zip"
+"$BUILD_TOOLS/aapt2" link -o "$stage/base.apk" -I "$PLATFORM_JAR" --manifest AndroidManifest.xml \
+    "${version_args[@]}" "$stage/res.zip"
 (cd "$stage" && zip -qr base.apk lib classes.dex classes2.dex)
 "$BUILD_TOOLS/zipalign" -f -p 4 "$stage/base.apk" "$stage/aligned.apk"
 
