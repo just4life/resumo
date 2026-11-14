@@ -124,6 +124,20 @@ pub const EVENT_ERROR: c_int = 0x10A;
 
 const SLAVE_TYPE_SUBTITLE: c_int = 0;
 
+const STATE_STOPPED: c_int = 5;
+const STATE_ENDED: c_int = 6;
+const STATE_ERROR: c_int = 7;
+
+/// How far a player has got with its media.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    /// Opening, playing or paused.
+    Busy,
+    /// Played to the end (or was stopped).
+    Finished,
+    Failed,
+}
+
 #[cfg_attr(windows, link(name = "libvlc"))]
 #[cfg_attr(not(windows), link(name = "vlc"))]
 extern "C" {
@@ -135,6 +149,7 @@ extern "C" {
     fn libvlc_media_new_path(inst: *mut libvlc_instance_t, path: *const c_char) -> *mut libvlc_media_t;
     fn libvlc_media_new_location(inst: *mut libvlc_instance_t, mrl: *const c_char) -> *mut libvlc_media_t;
     fn libvlc_media_release(md: *mut libvlc_media_t);
+    fn libvlc_media_add_option(md: *mut libvlc_media_t, option: *const c_char);
     fn libvlc_media_tracks_get(md: *mut libvlc_media_t, tracks: *mut *mut *mut libvlc_media_track_t) -> c_uint;
     fn libvlc_media_tracks_release(tracks: *mut *mut libvlc_media_track_t, count: c_uint);
     fn libvlc_media_get_codec_description(type_: c_int, codec: u32) -> *const c_char;
@@ -146,6 +161,7 @@ extern "C" {
     fn libvlc_media_player_get_media(mp: *mut libvlc_media_player_t) -> *mut libvlc_media_t;
     fn libvlc_media_player_event_manager(mp: *mut libvlc_media_player_t) -> *mut libvlc_event_manager_t;
     fn libvlc_media_player_is_playing(mp: *mut libvlc_media_player_t) -> c_int;
+    fn libvlc_media_player_get_state(mp: *mut libvlc_media_player_t) -> c_int;
     fn libvlc_media_player_play(mp: *mut libvlc_media_player_t) -> c_int;
     fn libvlc_media_player_set_pause(mp: *mut libvlc_media_player_t, do_pause: c_int);
     fn libvlc_media_player_stop(mp: *mut libvlc_media_player_t);
@@ -442,7 +458,15 @@ impl MediaPlayer {
 
     /// Loads a local path or a URL (anything with `://`).
     pub fn set_media(&self, location: &str) -> Result<(), String> {
+        self.set_media_with(location, &[])
+    }
+
+    /// Like [`set_media`](Self::set_media), with libVLC options for this
+    /// media only (`:start-time=10`, `:sout=...`).
+    pub fn set_media_with(&self, location: &str, options: &[String]) -> Result<(), String> {
         let c = CString::new(location).map_err(|e| e.to_string())?;
+        let options: Vec<CString> =
+            options.iter().map(|o| CString::new(o.as_str()).map_err(|e| e.to_string())).collect::<Result<_, _>>()?;
         unsafe {
             let md = if location.contains("://") {
                 libvlc_media_new_location(self.inst, c.as_ptr())
@@ -451,6 +475,9 @@ impl MediaPlayer {
             };
             if md.is_null() {
                 return Err(last_error());
+            }
+            for o in &options {
+                libvlc_media_add_option(md, o.as_ptr());
             }
             libvlc_media_player_set_media(self.raw, md);
             libvlc_media_release(md);
@@ -469,6 +496,13 @@ impl MediaPlayer {
     }
     pub fn is_playing(&self) -> bool {
         unsafe { libvlc_media_player_is_playing(self.raw) != 0 }
+    }
+    pub fn state(&self) -> State {
+        match unsafe { libvlc_media_player_get_state(self.raw) } {
+            STATE_STOPPED | STATE_ENDED => State::Finished,
+            STATE_ERROR => State::Failed,
+            _ => State::Busy,
+        }
     }
     pub fn is_seekable(&self) -> bool {
         unsafe { libvlc_media_player_is_seekable(self.raw) != 0 }

@@ -52,6 +52,11 @@ pub fn folder() -> PathBuf {
 
 /// "Movie 01-23-45.png" for a frame of "Movie" at 1:23:45, safe on every OS.
 pub fn file_name(title: &str, ms: i64) -> String {
+    format!("{} {}.png", safe_name(title), time_tag(ms))
+}
+
+/// `title` as a file name every OS accepts ("Resumo" if nothing is left).
+pub fn safe_name(title: &str) -> String {
     let mut name: String = title
         .chars()
         .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
@@ -62,8 +67,13 @@ pub fn file_name(title: &str, ms: i64) -> String {
     if name.is_empty() {
         name.push_str("Resumo");
     }
+    name
+}
+
+/// "01-23-45" for 1:23:45 (colons are not allowed in Windows file names).
+pub fn time_tag(ms: i64) -> String {
     let s = ms.max(0) / 1000;
-    format!("{name} {:02}-{:02}-{:02}.png", s / 3600, s / 60 % 60, s % 60)
+    format!("{:02}-{:02}-{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
 /// `dir/name`, or `dir/name (2)`, ... if that file already exists.
@@ -72,9 +82,12 @@ pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
     if !path.exists() {
         return path;
     }
-    let stem = name.strip_suffix(".png").unwrap_or(name);
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 => name.split_at(dot),
+        _ => (name, ""),
+    };
     (2..)
-        .map(|i| dir.join(format!("{stem} ({i}).png")))
+        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
         .find(|p| !p.exists())
         .expect("some name is free")
 }
@@ -98,8 +111,23 @@ pub fn reveal(path: &Path) {
     let _ = result;
 }
 
-#[cfg(windows)]
+/// The user's Videos folder, where saved clips go (in `Videos/Resumo`).
+pub fn videos_dir() -> PathBuf {
+    user_dir(UserDir::Videos)
+}
+
 fn pictures_dir() -> PathBuf {
+    user_dir(UserDir::Pictures)
+}
+
+#[derive(Clone, Copy)]
+enum UserDir {
+    Pictures,
+    Videos,
+}
+
+#[cfg(windows)]
+fn user_dir(which: UserDir) -> PathBuf {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStringExt;
 
@@ -107,6 +135,8 @@ fn pictures_dir() -> PathBuf {
     struct Guid(u32, u16, u16, [u8; 8]);
     const FOLDERID_PICTURES: Guid =
         Guid(0x33E2_8130, 0x4E1E, 0x4676, [0x83, 0x5A, 0x98, 0x39, 0x5C, 0x3B, 0xC3, 0xBB]);
+    const FOLDERID_VIDEOS: Guid =
+        Guid(0x1898_9B1D, 0x99B5, 0x455B, [0x84, 0x1C, 0xAB, 0x7C, 0x74, 0xE4, 0xDD, 0xFC]);
     #[link(name = "shell32")]
     extern "system" {
         fn SHGetKnownFolderPath(id: *const Guid, flags: u32, token: *mut c_void, path: *mut *mut u16) -> i32;
@@ -116,10 +146,14 @@ fn pictures_dir() -> PathBuf {
         fn CoTaskMemFree(p: *mut c_void);
     }
 
-    // The real Pictures folder, which may have been moved (e.g. to OneDrive).
+    let (id, fallback) = match which {
+        UserDir::Pictures => (&FOLDERID_PICTURES, "Pictures"),
+        UserDir::Videos => (&FOLDERID_VIDEOS, "Videos"),
+    };
+    // The real folder, which may have been moved (e.g. to OneDrive).
     unsafe {
         let mut raw = std::ptr::null_mut();
-        let hr = SHGetKnownFolderPath(&FOLDERID_PICTURES, 0, std::ptr::null_mut(), &mut raw);
+        let hr = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw);
         let found = (hr >= 0 && !raw.is_null()).then(|| {
             let len = (0..).take_while(|&i| *raw.add(i) != 0).count();
             PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(raw, len)))
@@ -130,17 +164,21 @@ fn pictures_dir() -> PathBuf {
         }
     }
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
-    home.join("Pictures")
+    home.join(fallback)
 }
 
 #[cfg(not(windows))]
-fn pictures_dir() -> PathBuf {
+fn user_dir(which: UserDir) -> PathBuf {
+    let (key, fallback) = match which {
+        UserDir::Pictures => ("XDG_PICTURES_DIR=", "Pictures"),
+        UserDir::Videos => ("XDG_VIDEOS_DIR=", "Videos"),
+    };
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     // Localised desktops name it in ~/.config/user-dirs.dirs, e.g. "$HOME/Изображения".
     let config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
     if let Ok(text) = std::fs::read_to_string(config.join("user-dirs.dirs")) {
         for line in text.lines() {
-            if let Some(v) = line.trim().strip_prefix("XDG_PICTURES_DIR=") {
+            if let Some(v) = line.trim().strip_prefix(key) {
                 let v = v.trim_matches('"');
                 let dir = match v.strip_prefix("$HOME") {
                     Some(rest) => home.join(rest.trim_start_matches('/')),
@@ -152,7 +190,7 @@ fn pictures_dir() -> PathBuf {
             }
         }
     }
-    home.join("Pictures")
+    home.join(fallback)
 }
 
 #[cfg(test)]
@@ -173,6 +211,7 @@ mod tests {
         let img = Image { width: 2, height: 1, rgba: vec![255, 0, 0, 0, 0, 255, 0, 0] };
         img.save_png(&first).unwrap();
         assert_eq!(unique_path(&dir, "a.png"), dir.join("a (2).png"));
+        assert_eq!(unique_path(&dir, "b 1.5x.mp4"), dir.join("b 1.5x.mp4"));
         let bytes = std::fs::read(&first).unwrap();
         assert_eq!(&bytes[1..4], b"PNG");
         std::fs::remove_dir_all(dir).ok();
