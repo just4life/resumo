@@ -28,7 +28,7 @@ impl Item {
     pub fn new(location: impl Into<String>) -> Self {
         let location = location.into();
         let title = if location.contains("://") {
-            location.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&location).to_owned()
+            url_title(&location)
         } else {
             Path::new(&location)
                 .file_stem()
@@ -37,6 +37,63 @@ impl Item {
         };
         Self { location, title, duration: None }
     }
+}
+
+/// A short, readable name for a network address: the Twitch channel for
+/// twitch.tv links, otherwise the last path segment without the query,
+/// fragment and media extension (`…/hls/name.m3u8?token=…` gives `name`).
+pub fn url_title(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let segments: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(percent_decode).collect();
+
+    if host == "twitch.tv" || host.ends_with(".twitch.tv") {
+        match segments.as_slice() {
+            [first, ..] if first != "videos" => return first.clone(),
+            [_, id, ..] => return format!("Twitch {id}"),
+            _ => {}
+        }
+    }
+
+    // Generic manifest names say nothing, so step back to the folder above.
+    const GENERIC: &[&str] = &["index", "playlist", "master", "manifest", "chunklist", "stream", "live"];
+    for seg in segments.iter().rev() {
+        let stem = match seg.rsplit_once('.') {
+            Some((stem, ext))
+                if !stem.is_empty()
+                    && MEDIA_EXTENSIONS.iter().chain(PLAYLIST_EXTENSIONS).chain(&["mpd"]).any(|e| e.eq_ignore_ascii_case(ext)) =>
+            {
+                stem
+            }
+            _ => seg.as_str(),
+        };
+        if !GENERIC.iter().any(|g| g.eq_ignore_ascii_case(stem)) {
+            return stem.to_owned();
+        }
+    }
+    if host.is_empty() { url.to_owned() } else { host }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_owned())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -242,6 +299,22 @@ mod tests {
         assert_eq!(p.current, Some(1));
         p.remove(1);
         assert_eq!(p.current, None);
+    }
+
+    #[test]
+    fn url_titles_are_short() {
+        assert_eq!(url_title("https://www.twitch.tv/sadovov_58"), "sadovov_58");
+        assert_eq!(url_title("https://twitch.tv/sadovov_58?sr=a"), "sadovov_58");
+        assert_eq!(url_title("https://m.twitch.tv/videos/123456"), "Twitch 123456");
+        assert_eq!(
+            url_title("https://usher.ttvnw.net/api/channel/hls/sadovov_58.m3u8?allow_source=true&sig=abc%7B"),
+            "sadovov_58"
+        );
+        assert_eq!(url_title("http://x/films/My%20Film.mkv#t=10"), "My Film");
+        assert_eq!(url_title("https://cdn.example.com/show/ep1/index.m3u8?token=1"), "ep1");
+        assert_eq!(url_title("https://example.com/"), "example.com");
+        assert_eq!(url_title("rtsp://user:pw@cam.local:554/"), "cam.local");
+        assert_eq!(Item::new("http://x/1.mp4").title, "1");
     }
 
     #[test]

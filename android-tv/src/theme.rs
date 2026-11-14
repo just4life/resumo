@@ -308,19 +308,28 @@ pub fn caption_button(ui: &mut Ui, icon: Icon, tip: &str) -> Response {
 
 /// Rounded button with an icon and a label, for primary actions.
 pub fn pill(ui: &mut Ui, icon: Option<Icon>, text: &str) -> Response {
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(14.0), TEXT);
+    pill_colored(ui, icon, text, (ACCENT, ACCENT_HOVER), Color32::WHITE)
+}
+
+/// Quieter pill for actions next to the main one.
+pub fn pill_secondary(ui: &mut Ui, icon: Option<Icon>, text: &str) -> Response {
+    pill_colored(ui, icon, text, (SURFACE_HI, TRACK), TEXT)
+}
+
+fn pill_colored(ui: &mut Ui, icon: Option<Icon>, text: &str, (fill, hover): (Color32, Color32), ink: Color32) -> Response {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::proportional(14.0), ink);
     let icon_w = if icon.is_some() { 22.0 } else { 0.0 };
     let size = vec2(galley.size().x + icon_w + 28.0, 30.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let fill = if resp.hovered() { ACCENT_HOVER } else { ACCENT };
+    let fill = if resp.hovered() { hover } else { fill };
     ui.painter().rect_filled(rect, 15.0, fill);
     let mut x = rect.min.x + 14.0;
     if let Some(i) = icon {
         let r = Rect::from_center_size(pos2(x + 8.0, rect.center().y), vec2(16.0, 16.0));
-        paint_icon(ui.painter(), r, i, Color32::WHITE);
+        paint_icon(ui.painter(), r, i, ink);
         x += icon_w;
     }
-    ui.painter().galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, Color32::WHITE);
+    ui.painter().galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, ink);
     resp
 }
 
