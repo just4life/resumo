@@ -98,9 +98,14 @@ pub fn reveal(path: &Path) {
     let result = if path.is_dir() {
         std::process::Command::new("explorer").arg(path).spawn()
     } else {
-        let mut select = std::ffi::OsString::from("/select,");
+        use std::os::windows::process::CommandExt;
+        // Explorer wants the quotes around the path only: /select,"C:\a b.mp4".
+        // `arg` would quote the whole argument when the path has a space, and
+        // Explorer then opens Documents instead.
+        let mut select = std::ffi::OsString::from("/select,\"");
         select.push(path);
-        std::process::Command::new("explorer").arg(select).spawn()
+        select.push("\"");
+        std::process::Command::new("explorer").raw_arg(select).spawn()
     };
     #[cfg(not(windows))]
     let result = {
