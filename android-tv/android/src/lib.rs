@@ -8,6 +8,8 @@
 mod app;
 #[path = "../../src/browser.rs"]
 mod browser;
+#[path = "../../src/chat.rs"]
+mod chat;
 #[path = "../../src/crop.rs"]
 mod crop;
 #[path = "../../src/history.rs"]

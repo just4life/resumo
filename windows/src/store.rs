@@ -40,6 +40,8 @@ pub struct Store {
     positions: Vec<(String, i64)>,
     pub volume: Option<i32>,
     pub audio_device: Option<String>,
+    /// The user turned off the chat shown with Twitch streams.
+    pub chat_off: bool,
     /// The user turned off our HDR → SDR conversion.
     pub hdr_off: bool,
     /// Brightness of converted HDR video, percent (100 = default).
@@ -73,6 +75,7 @@ impl Store {
                 match line.split_once('=') {
                     Some(("volume", v)) => store.volume = v.trim().parse().ok(),
                     Some(("audio_device", v)) if !v.is_empty() => store.audio_device = Some(v.to_owned()),
+                    Some(("twitch_chat", v)) => store.chat_off = v.trim() == "off",
                     Some(("hdr_to_sdr", v)) => store.hdr_off = v.trim() == "off",
                     Some(("hdr_brightness", v)) => store.hdr_brightness = v.trim().parse().ok(),
                     Some(("subtitle_scale", v)) => store.subtitle_scale = v.trim().parse().ok(),
@@ -117,6 +120,13 @@ impl Store {
     pub fn set_volume(&mut self, volume: i32) {
         if self.volume != Some(volume) {
             self.volume = Some(volume);
+            self.dirty = true;
+        }
+    }
+
+    pub fn set_chat_off(&mut self, off: bool) {
+        if self.chat_off != off {
+            self.chat_off = off;
             self.dirty = true;
         }
     }
@@ -178,6 +188,9 @@ impl Store {
         }
         if let Some(d) = &self.audio_device {
             settings.push_str(&format!("audio_device={d}\n"));
+        }
+        if self.chat_off {
+            settings.push_str("twitch_chat=off\n");
         }
         if self.hdr_off {
             settings.push_str("hdr_to_sdr=off\n");

@@ -2061,6 +2061,8 @@ dependencies = [
  "png",
  "raw-window-handle",
  "rfd",
+ "rustls",
+ "rustls-native-certs",
  "ureq",
 ]
 

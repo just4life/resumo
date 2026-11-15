@@ -142,6 +142,8 @@ enum PanelRow {
     Bars,
     Hdr,
     Output,
+    /// The chat of the Twitch stream over the video, on or off.
+    Chat,
     Speed(f32),
     Repeat,
     Shuffle,
@@ -585,6 +587,10 @@ impl PlayerApp {
                     rows.push(PanelRow::Hdr);
                 }
                 rows.push(PanelRow::Output);
+                if self.twitch_channel().is_some() {
+                    rows.push(PanelRow::Header("Twitch"));
+                    rows.push(PanelRow::Chat);
+                }
             }
             Panel::Speed => rows.extend(SPEEDS.iter().map(|s| PanelRow::Speed(*s))),
             Panel::Playlist => {
@@ -646,6 +652,7 @@ impl PlayerApp {
                 self.android.view.save();
                 self.notify(format!("HDR → SDR: {}", self.hdr_label()));
             }
+            PanelRow::Chat => self.toggle_chat(),
             PanelRow::Output => {
                 // libVLC's output is fixed once the player exists: start afresh.
                 let all = Output::ALL;
@@ -851,6 +858,14 @@ impl PlayerApp {
             p.circle_filled(screen.center(), 38.0, Color32::from_black_alpha(150));
             let icon = Rect::from_center_size(screen.center() + vec2(2.0, 0.0), vec2(30.0, 30.0));
             theme::paint_icon(&p, icon, Icon::Play, Color32::WHITE);
+        }
+
+        // The chat of a Twitch stream, at the left above where the bar shows.
+        if self.chat.is_some() && self.android.tv.panel.is_none() {
+            let width = (screen.width() * 0.3).clamp(300.0, 560.0);
+            let bottom = screen.bottom() - 200.0;
+            let area = Rect::from_min_max(pos2(screen.left() + 40.0, bottom - screen.height() * 0.45), pos2(screen.left() + 40.0 + width, bottom));
+            self.paint_chat(&p, area, 18.0);
         }
 
         let bar = self.bar_visible();
@@ -1067,6 +1082,7 @@ impl PlayerApp {
             PanelRow::Bars => tv::row(p, r, None, "Чёрные полосы в кадре", Trail::Value(&self.bars_label()), focused, false),
             PanelRow::Hdr => tv::row(p, r, None, "HDR → SDR", Trail::Value(&self.hdr_label()), focused, false),
             PanelRow::Output => tv::row(p, r, None, "Вывод видео", Trail::Value(&self.output_label()), focused, false),
+            PanelRow::Chat => tv::row(p, r, None, "Чат поверх видео", Trail::Switch(!self.store.chat_off), focused, false),
             PanelRow::Speed(s) => {
                 let label = if *s == 1.0 { "Обычная".to_owned() } else { format!("{}×", trim_float(*s)) };
                 tv::row(p, r, None, &label, Trail::Check(current), focused, false)

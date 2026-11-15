@@ -4,6 +4,7 @@
 
 mod app;
 mod awake;
+mod chat;
 mod clip;
 mod crop;
 mod fit;

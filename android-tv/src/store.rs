@@ -68,6 +68,8 @@ pub struct Store {
     watched: Vec<String>,
     pub volume: Option<i32>,
     pub audio_device: Option<String>,
+    /// The user turned off the chat shown with Twitch streams.
+    pub chat_off: bool,
     dirty: bool,
 }
 
@@ -100,6 +102,7 @@ impl Store {
                 match line.split_once('=') {
                     Some(("volume", v)) => store.volume = v.trim().parse().ok(),
                     Some(("audio_device", v)) if !v.is_empty() => store.audio_device = Some(v.to_owned()),
+                    Some(("twitch_chat", v)) => store.chat_off = v.trim() == "off",
                     _ => {}
                 }
             }
@@ -183,6 +186,13 @@ impl Store {
         }
     }
 
+    pub fn set_chat_off(&mut self, off: bool) {
+        if self.chat_off != off {
+            self.chat_off = off;
+            self.dirty = true;
+        }
+    }
+
     pub fn set_audio_device(&mut self, device: Option<String>) {
         if self.audio_device != device {
             self.audio_device = device;
@@ -215,6 +225,9 @@ impl Store {
         }
         if let Some(d) = &self.audio_device {
             settings.push_str(&format!("audio_device={d}\n"));
+        }
+        if self.chat_off {
+            settings.push_str("twitch_chat=off\n");
         }
         let ok = write_atomic(&dir.join("positions.tsv"), &positions)
             && write_atomic(&dir.join("watched.txt"), &watched)

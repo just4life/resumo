@@ -11,6 +11,9 @@ egui = "0.37"
 png = "0.18"
 rfd = "0.17"
 ureq = { version = "2.12", default-features = false, features = ["tls", "native-certs"] }
+# The same TLS that ureq brings, used directly for the chat's WebSocket.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.7"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"

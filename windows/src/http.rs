@@ -1,5 +1,8 @@
 //! The few HTTPS requests the player makes itself (libVLC does the rest).
 
+use std::io::{self, Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,4 +35,90 @@ pub fn request(method: Method, url: &str, headers: &[(&str, &str)], body: Option
     };
     let status = response.status();
     response.into_string().map(|text| (status, text)).map_err(|e| e.to_string())
+}
+
+/// A connection to read from and write to.
+pub trait Stream: Read + Write + Send {}
+
+impl<T: Read + Write + Send> Stream for T {}
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Opens an encrypted connection to `host`, through the proxy the
+/// environment names if there is one. Reads that get nothing for
+/// `read_timeout` fail with `WouldBlock` or `TimedOut` and may be repeated.
+/// Blocks: call it off the UI thread.
+pub fn tls_connect(host: &str, port: u16, read_timeout: Duration) -> Result<Box<dyn Stream>, String> {
+    let text = |e: io::Error| e.to_string();
+    let tcp = match proxy() {
+        Some(proxy) => through_proxy(&proxy, host, port).map_err(text)?,
+        None => dial(&format!("{host}:{port}")).map_err(text)?,
+    };
+    tcp.set_read_timeout(Some(read_timeout)).map_err(text)?;
+    tcp.set_write_timeout(Some(CONNECT_TIMEOUT)).map_err(text)?;
+    let name = rustls::pki_types::ServerName::try_from(host.to_owned()).map_err(|e| e.to_string())?;
+    let session = rustls::ClientConnection::new(tls_config()?, name).map_err(|e| e.to_string())?;
+    Ok(Box::new(rustls::StreamOwned::new(session, tcp)))
+}
+
+fn dial(address: &str) -> io::Result<TcpStream> {
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "адрес не найден");
+    for addr in address.to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(stream) => return Ok(stream),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// The HTTPS proxy from the environment, as `host:port`.
+fn proxy() -> Option<String> {
+    let value = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"].iter().find_map(|name| std::env::var(name).ok())?;
+    let value = value.trim();
+    let rest = value.strip_prefix("http://").unwrap_or(value);
+    // Other kinds of proxy (socks) are not spoken here.
+    let address = rest.split('/').next().unwrap_or_default().rsplit('@').next().unwrap_or_default();
+    (!address.is_empty() && !rest.contains("://")).then(|| address.to_owned())
+}
+
+/// Asks the proxy for a tunnel to `host:port`.
+fn through_proxy(proxy: &str, host: &str, port: u16) -> io::Result<TcpStream> {
+    let mut tcp = dial(proxy)?;
+    tcp.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    tcp.write_all(format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes())?;
+    // The answer byte by byte, so as not to take any of what follows it.
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if tcp.read(&mut byte)? == 0 || head.len() > 8192 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        head.push(byte[0]);
+    }
+    let status = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_owned();
+    if status.split(' ').nth(1) == Some("200") {
+        Ok(tcp)
+    } else {
+        Err(io::Error::other(format!("прокси ответил «{status}»")))
+    }
+}
+
+/// The system's certificates, read once.
+fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
+    static CONFIG: OnceLock<Result<Arc<rustls::ClientConfig>, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            let certs = rustls_native_certs::load_native_certs().map_err(|e| format!("нет сертификатов системы ({e})"))?;
+            roots.add_parsable_certificates(certs);
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|e| e.to_string())?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            Ok(Arc::new(config))
+        })
+        .clone()
 }
