@@ -28,6 +28,8 @@ mod surface;
 mod osk;
 #[path = "../../src/playlist.rs"]
 mod playlist;
+#[path = "../../src/sites.rs"]
+mod sites;
 #[path = "../../src/store.rs"]
 mod store;
 #[path = "../../src/taskbar.rs"]
@@ -42,6 +44,8 @@ mod tv;
 mod video;
 #[path = "../../src/vlc.rs"]
 mod vlc;
+#[path = "../../src/youtube.rs"]
+mod youtube;
 #[path = "../../src/zoom.rs"]
 mod zoom;
 

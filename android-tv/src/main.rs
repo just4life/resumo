@@ -8,12 +8,14 @@ mod crop;
 mod http;
 mod live;
 mod playlist;
+mod sites;
 mod store;
 mod taskbar;
 mod theme;
 mod twitch;
 mod video;
 mod vlc;
+mod youtube;
 
 use std::path::PathBuf;
 

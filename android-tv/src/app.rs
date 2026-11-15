@@ -23,6 +23,7 @@ use crate::lan;
 #[cfg(target_os = "android")]
 use crate::platform;
 use crate::playlist::{self, Playlist, Repeat};
+use crate::sites::{self, Site};
 use crate::store::Store;
 use crate::taskbar::{self, ThumbBar};
 use crate::theme::{self, Icon};
@@ -121,9 +122,10 @@ pub struct PlayerApp {
     pub(crate) live: live::Detector,
     /// The clock the live stream's time is compared with.
     clock: Instant,
-    /// A Twitch channel is about to play: its location in the playlist, and
-    /// where the address of its stream arrives from the thread asking Twitch.
-    resolving: Option<(String, mpsc::Receiver<Result<String, String>>)>,
+    /// A page of a site (Twitch, YouTube) is about to play: its location in
+    /// the playlist, the site's name, and where its stream arrives from the
+    /// thread asking the site.
+    resolving: Option<(String, &'static str, mpsc::Receiver<Result<sites::Stream, String>>)>,
     /// The chat of the Twitch channel being played, unless it is turned off.
     pub(crate) chat: Option<chat::Chat>,
     pub(crate) chat_log: chat::Log,
@@ -405,9 +407,9 @@ impl PlayerApp {
         let Some(item) = self.playlist.items.get(index) else { return };
         let location = item.location.clone();
         self.resolving = None;
-        // A Twitch channel is a page, not a stream: ask Twitch where the
-        // stream is first, without holding up the screen meanwhile.
-        if let Some(channel) = twitch::channel(&location) {
+        // A page of Twitch or YouTube is not a stream: ask the site where
+        // the stream is first, without holding up the screen meanwhile.
+        if let Some(site) = Site::of(&location) {
             self.remember_position();
             self.player.stop();
             self.events.reset();
@@ -416,44 +418,52 @@ impl PlayerApp {
             self.selected = Some(index);
             self.seek_drag = None;
             self.resume_at = None;
-            self.live = live::Detector::new(true);
+            self.live = live::Detector::new(site.always_live());
+            let name = site.name();
             let (tx, rx) = mpsc::channel();
             let ctx = self.events.repaint.lock().unwrap().clone();
             std::thread::spawn(move || {
-                let _ = tx.send(twitch::resolve(&channel));
+                let _ = tx.send(site.resolve());
                 if let Some(ctx) = ctx {
                     ctx.request_repaint();
                 }
             });
-            self.resolving = Some((location, rx));
+            self.resolving = Some((location, name, rx));
             return;
         }
         self.live = live::Detector::new(false);
-        self.open_index(index, None);
+        self.open_index(index, None, None);
     }
 
-    /// Takes the answer about a Twitch channel's stream, once it is there.
+    /// Takes a site's answer about the stream, once it is there.
     fn poll_resolving(&mut self) {
-        let Some((location, rx)) = self.resolving.take() else { return };
+        let Some((location, site, rx)) = self.resolving.take() else { return };
         let result = match rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => {
-                self.resolving = Some((location, rx));
+                self.resolving = Some((location, site, rx));
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => Err("не удалось получить поток".to_owned()),
         };
-        // The playlist may have changed while Twitch was answering.
+        // The playlist may have changed while the site was answering.
         let Some(index) = self.playlist.current.filter(|&i| self.playlist.items.get(i).is_some_and(|it| it.location == location))
         else {
             return;
         };
         match result {
-            Ok(address) => self.open_index(index, Some(&address)),
+            Ok(stream) => {
+                if let (Some(title), Some(item)) = (&stream.title, self.playlist.items.get_mut(index)) {
+                    item.title = title.clone();
+                }
+                // Only now is it known whether a YouTube link is a broadcast.
+                self.live = live::Detector::new(stream.live || self.live.expects_live());
+                self.open_index(index, Some(&stream.address), stream.audio.as_deref());
+            }
             Err(e) => {
                 let name = self.current_title().unwrap_or_default();
                 self.stop();
-                self.notify(format!("Twitch, {name}: {e}"));
+                self.notify(format!("{site}, {name}: {e}"));
             }
         }
     }
@@ -490,8 +500,9 @@ impl PlayerApp {
     }
 
     /// Plays the playlist's entry `index`, from `address` if that is not the
-    /// entry's own location (a Twitch channel's stream).
-    fn open_index(&mut self, index: usize, address: Option<&str>) {
+    /// entry's own location (the stream of a Twitch or YouTube page), with
+    /// the sound from `audio` if it comes apart from the picture.
+    fn open_index(&mut self, index: usize, address: Option<&str>, audio: Option<&str>) {
         let Some(item) = self.playlist.items.get(index) else { return };
         let location = item.location.clone();
         let source = address.unwrap_or(&location).to_owned();
@@ -517,6 +528,9 @@ impl PlayerApp {
         }
         #[cfg(not(target_os = "android"))]
         let options = Vec::new();
+        // libVLC plays a second address alongside as the media's "slave".
+        let mut options: Vec<String> = options;
+        options.extend(audio.map(|a| format!(":input-slave={a}")));
         #[cfg(target_os = "android")]
         let set = if local {
             let path = PathBuf::from(&location);

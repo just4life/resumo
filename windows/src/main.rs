@@ -14,6 +14,9 @@ mod http;
 mod info;
 mod live;
 mod playlist;
+mod proxy;
+mod relay;
+mod sites;
 mod snapshot;
 mod store;
 mod taskbar;
@@ -21,6 +24,7 @@ mod theme;
 mod twitch;
 mod video;
 mod vlc;
+mod youtube;
 
 use std::path::PathBuf;
 

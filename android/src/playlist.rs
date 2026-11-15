@@ -58,6 +58,14 @@ pub fn url_title(url: &str) -> String {
         }
     }
 
+    // The video's own title replaces this once YouTube has told it.
+    if crate::youtube::link(url).is_some() {
+        return match segments.as_slice() {
+            [channel, ..] if channel.starts_with('@') => channel.clone(),
+            _ => "YouTube".to_owned(),
+        };
+    }
+
     // Generic manifest names say nothing, so step back to the folder above.
     const GENERIC: &[&str] = &["index", "playlist", "master", "manifest", "chunklist", "stream", "live"];
     for seg in segments.iter().rev() {
@@ -306,6 +314,8 @@ mod tests {
         assert_eq!(url_title("https://www.twitch.tv/sadovov_58"), "sadovov_58");
         assert_eq!(url_title("https://twitch.tv/sadovov_58?sr=a"), "sadovov_58");
         assert_eq!(url_title("https://m.twitch.tv/videos/123456"), "Twitch 123456");
+        assert_eq!(url_title("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), "YouTube");
+        assert_eq!(url_title("https://www.youtube.com/@NASA/live"), "@NASA");
         assert_eq!(
             url_title("https://usher.ttvnw.net/api/channel/hls/sadovov_58.m3u8?allow_source=true&sig=abc%7B"),
             "sadovov_58"
