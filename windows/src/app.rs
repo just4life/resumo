@@ -20,6 +20,7 @@ use crate::fit;
 use crate::info;
 use crate::live;
 use crate::playlist::{self, Playlist, Repeat};
+use crate::sites::{self, Site};
 use crate::snapshot::{self, Image};
 use crate::store::Store;
 use crate::awake::{self, KeepAwake};
@@ -208,9 +209,10 @@ pub struct PlayerApp {
     live: live::Detector,
     /// The clock the live stream's time is compared with.
     clock: Instant,
-    /// A Twitch channel is about to play: its location in the playlist, and
-    /// where the address of its stream arrives from the thread asking Twitch.
-    resolving: Option<(String, mpsc::Receiver<Result<String, String>>)>,
+    /// A page of a site (Twitch, YouTube) is about to play: its location in
+    /// the playlist, the site's name, and where its stream arrives from the
+    /// thread asking the site.
+    resolving: Option<(String, &'static str, mpsc::Receiver<Result<sites::Stream, String>>)>,
     /// The chat of the Twitch channel being played, unless it is turned off.
     pub(crate) chat: Option<chat::Chat>,
     pub(crate) chat_log: chat::Log,
@@ -350,28 +352,30 @@ impl PlayerApp {
         self.hdr_wait = None;
         self.resolving = None;
 
-        // A Twitch channel is a page, not a stream: ask Twitch where the
-        // stream is first, without holding up the window meanwhile.
-        if let Some(channel) = twitch::channel(&location) {
-            self.live = live::Detector::new(true);
+        // A page of Twitch or YouTube is not a stream: ask the site where
+        // the stream is first, without holding up the window meanwhile.
+        if let Some(site) = Site::of(&location) {
+            self.live = live::Detector::new(site.always_live());
             let (tx, rx) = mpsc::channel();
             let ctx = self.events.repaint.lock().unwrap().clone();
+            let name = site.name();
             std::thread::spawn(move || {
-                let _ = tx.send(twitch::resolve(&channel));
+                let _ = tx.send(site.resolve());
                 if let Some(ctx) = ctx {
                     ctx.request_repaint();
                 }
             });
-            self.resolving = Some((location, rx));
+            self.resolving = Some((location, name, rx));
             return;
         }
         self.live = live::Detector::new(false);
-        self.start_media(&location, &location);
+        self.start_media(&location, &location, None);
     }
 
-    /// Plays `address` as the playlist's `location` (they differ for a Twitch
-    /// channel). The player is stopped and the state reset by `play_index`.
-    fn start_media(&mut self, location: &str, address: &str) {
+    /// Plays `address` as the playlist's `location` (they differ for a page
+    /// of Twitch or YouTube), with the sound from `audio` if it comes apart.
+    /// The player is stopped and the state reset by `play_index`.
+    fn start_media(&mut self, location: &str, address: &str, audio: Option<&str>) {
         // libVLC doesn't report the transfer function, so read it ourselves.
         self.hdr = if location.contains("://") { None } else { hdr::probe(Path::new(location)) };
         self.hdr_active = self.hdr.is_some()
@@ -379,7 +383,9 @@ impl PlayerApp {
             && !self.store.hdr_off
             && self.hdr_failed.as_deref() != Some(location);
         self.sink.set_format(if self.hdr_active { PixelFormat::P010 } else { PixelFormat::Rgba });
-        if let Err(e) = self.player.set_media(address) {
+        // libVLC plays a second address alongside as the media's "slave".
+        let options: Vec<String> = audio.map(|a| format!(":input-slave={a}")).into_iter().collect();
+        if let Err(e) = self.player.set_media_with(address, &options) {
             self.playlist.current = None;
             self.notify(format!("Не удалось открыть: {e}"));
             return;
@@ -391,28 +397,35 @@ impl PlayerApp {
         }
     }
 
-    /// Takes the answer about a Twitch channel's stream, once it is there.
+    /// Takes a site's answer about the stream, once it is there.
     fn poll_resolving(&mut self) {
-        let Some((location, rx)) = self.resolving.take() else { return };
+        let Some((location, site, rx)) = self.resolving.take() else { return };
         let result = match rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => {
-                self.resolving = Some((location, rx));
+                self.resolving = Some((location, site, rx));
                 return;
             }
             Err(mpsc::TryRecvError::Disconnected) => Err("не удалось получить поток".to_owned()),
         };
-        // The playlist may have changed while Twitch was answering.
-        let current = self.playlist.current.and_then(|i| self.playlist.items.get(i));
-        if current.is_none_or(|item| item.location != location) {
+        // The playlist may have changed while the site was answering.
+        let Some(index) = self.playlist.current.filter(|&i| self.playlist.items.get(i).is_some_and(|it| it.location == location))
+        else {
             return;
-        }
+        };
         match result {
-            Ok(address) => self.start_media(&location, &address),
+            Ok(stream) => {
+                if let (Some(title), Some(item)) = (&stream.title, self.playlist.items.get_mut(index)) {
+                    item.title = title.clone();
+                }
+                // Only now is it known whether a YouTube link is a broadcast.
+                self.live = live::Detector::new(stream.live || self.live.expects_live());
+                self.start_media(&location, &stream.address, stream.audio.as_deref());
+            }
             Err(e) => {
                 let name = self.current_title().unwrap_or_default();
                 self.stop();
-                self.notify(format!("Twitch, {name}: {e}"));
+                self.notify(format!("{site}, {name}: {e}"));
             }
         }
     }
@@ -621,6 +634,12 @@ impl PlayerApp {
     fn mark_clip_start(&mut self) {
         if self.is_live() {
             self.notify("Из прямого эфира клип вырезать нельзя");
+            return;
+        }
+        // The clip is cut from the file itself, and a site's page is not one.
+        let location = self.playlist.current.and_then(|i| self.playlist.items.get(i)).map(|it| it.location.as_str());
+        if let Some(site) = location.and_then(Site::of) {
+            self.notify(format!("Из видео {} клип вырезать нельзя", site.name()));
             return;
         }
         if !self.is_active() || !self.player.is_seekable() || self.player.length().is_none() {

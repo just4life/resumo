@@ -456,13 +456,8 @@ impl MediaPlayer {
         }
     }
 
-    /// Loads a local path or a URL (anything with `://`).
-    pub fn set_media(&self, location: &str) -> Result<(), String> {
-        self.set_media_with(location, &[])
-    }
-
-    /// Like [`set_media`](Self::set_media), with libVLC options for this
-    /// media only (`:start-time=10`, `:sout=...`).
+    /// Loads a local path or a URL (anything with `://`), with libVLC
+    /// options for this media only (`:start-time=10`, `:sout=...`).
     pub fn set_media_with(&self, location: &str, options: &[String]) -> Result<(), String> {
         let c = CString::new(location).map_err(|e| e.to_string())?;
         let options: Vec<CString> =

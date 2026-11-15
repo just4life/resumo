@@ -24,6 +24,8 @@ mod live;
 mod platform;
 #[path = "../../src/playlist.rs"]
 mod playlist;
+#[path = "../../src/sites.rs"]
+mod sites;
 #[path = "../../src/store.rs"]
 mod store;
 mod surface;
@@ -37,6 +39,8 @@ mod twitch;
 mod video;
 #[path = "../../src/vlc.rs"]
 mod vlc;
+#[path = "../../src/youtube.rs"]
+mod youtube;
 #[path = "../../src/zoom.rs"]
 mod zoom;
 
