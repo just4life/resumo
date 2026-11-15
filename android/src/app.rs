@@ -1133,7 +1133,7 @@ impl PlayerApp {
                 self.android.keep_screen_on = playing;
                 platform::set_keep_screen_on(playing);
             }
-            self.android.guard.tick(playing && self.shows_picture());
+            self.android.guard.tick(playing && self.shows_picture(), self.android.pip);
             self.media_actions();
             self.publish_media();
             // (With the decoder's own output, in `gpu_frame`.)

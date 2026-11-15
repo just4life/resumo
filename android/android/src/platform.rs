@@ -1091,6 +1091,12 @@ fn app_visible() -> bool {
 /// "hidden". Audio-only media keeps playing, like in music players, and so
 /// does everything while the screen is off or locked (the sound goes on,
 /// see `PlayerApp::background_tick`).
+///
+/// It also pauses when the picture-in-picture window is dragged away to
+/// close it, like YouTube. Android does not say so directly: the app was in
+/// the small window, its frames stop and it is in that mode no more. (The
+/// playback service keeps the process "important", so the visibility check
+/// alone would miss it.)
 pub struct BackgroundGuard {
     shared: Arc<GuardState>,
 }
@@ -1099,6 +1105,8 @@ struct GuardState {
     start: Instant,
     last_frame_ms: AtomicU64,
     has_video: AtomicBool,
+    /// In the picture-in-picture window as of the last frame.
+    pip: AtomicBool,
     paused: AtomicBool,
 }
 
@@ -1114,6 +1122,7 @@ impl BackgroundGuard {
             start: Instant::now(),
             last_frame_ms: AtomicU64::new(0),
             has_video: AtomicBool::new(false),
+            pip: AtomicBool::new(false),
             paused: AtomicBool::new(false),
         });
         let s = shared.clone();
@@ -1124,14 +1133,15 @@ impl BackgroundGuard {
                 let idle = s.now_ms().saturating_sub(s.last_frame_ms.load(Ordering::SeqCst));
                 // Frames also stall for a moment while a network video opens, so
                 // ask Android before pausing.
-                if idle > 1500
-                    && s.has_video.load(Ordering::SeqCst)
-                    && !s.paused.load(Ordering::SeqCst)
-                    && !app_visible()
-                    && !screen_locked()
-                {
+                if !s.has_video.load(Ordering::SeqCst) || s.paused.load(Ordering::SeqCst) {
+                    continue;
+                }
+                // The small window was closed: sooner than the general case,
+                // nothing else stops frames while it is shown.
+                let pip_closed = idle > 800 && s.pip.load(Ordering::SeqCst) && !in_pip();
+                if (pip_closed || (idle > 1500 && !app_visible())) && !screen_locked() {
                     s.paused.store(true, Ordering::SeqCst);
-                    log::info!("app hidden, pausing video");
+                    log::info!("app hidden (small window closed: {pip_closed}), pausing video");
                     pause();
                 }
             })
@@ -1140,9 +1150,10 @@ impl BackgroundGuard {
     }
 
     /// Call once per UI frame.
-    pub fn tick(&self, video_playing: bool) {
+    pub fn tick(&self, video_playing: bool, pip: bool) {
         self.shared.last_frame_ms.store(self.shared.now_ms(), Ordering::SeqCst);
         self.shared.has_video.store(video_playing, Ordering::SeqCst);
+        self.shared.pip.store(pip, Ordering::SeqCst);
         self.shared.paused.store(false, Ordering::SeqCst);
     }
 }
