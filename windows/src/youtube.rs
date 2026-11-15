@@ -31,6 +31,9 @@ struct Client {
     user_agent: &'static str,
     /// The rest of what the app says of itself.
     device: fn() -> Value,
+    /// Its addresses of separate picture and sound are refused without a
+    /// proof only the real app has: its HLS playlist is taken instead.
+    playlist_only: bool,
 }
 
 /// The apps to ask as, in turn, until one gets streams: the VR app first,
@@ -42,6 +45,7 @@ const CLIENTS: &[Client] = &[
         version: "1.62.27",
         user_agent: "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
         device: || json!({"deviceMake": "Oculus", "deviceModel": "Quest 3", "androidSdkVersion": 32, "osName": "Android", "osVersion": "12L"}),
+        playlist_only: false,
     },
     Client {
         name: "IOS",
@@ -49,6 +53,7 @@ const CLIENTS: &[Client] = &[
         version: "20.03.02",
         user_agent: "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)",
         device: || json!({"deviceMake": "Apple", "deviceModel": "iPhone16,2", "osName": "iPhone", "osVersion": "18.2.1.22C161"}),
+        playlist_only: true,
     },
 ];
 
@@ -126,12 +131,29 @@ pub fn resolve(link: &Link) -> Result<Stream, String> {
     };
     let mut first_error = None;
     for client in CLIENTS {
-        match ask(client, &id).and_then(|answer| pick(&answer)) {
+        let answer = ask(client, &id).and_then(|answer| pick(&answer, client.playlist_only));
+        match &answer {
+            Ok(stream) => note(&format!("{}: {}{}", client.name, stream.address, if stream.audio.is_some() { " + sound" } else { "" })),
+            Err(e) => note(&format!("{}: {e}", client.name)),
+        }
+        match answer {
             Ok(stream) => return Ok(stream),
             Err(e) => first_error = first_error.or(Some(e)),
         }
     }
     Err(first_error.unwrap_or_else(|| "видео недоступно".to_owned()))
+}
+
+/// Writes down what each app was answered, beside libVLC's log, when the
+/// user asked for one (`RESUMO_VLC_LOG`).
+fn note(line: &str) {
+    use std::io::Write;
+    let Some(log) = std::env::var_os("RESUMO_VLC_LOG").filter(|f| !f.is_empty()) else { return };
+    let mut path = log;
+    path.push(".youtube.txt");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 /// The video a channel is broadcasting now: its "live" page names it as the
@@ -181,7 +203,7 @@ fn ask(client: &Client, id: &str) -> Result<Value, String> {
 }
 
 /// Chooses what to play from the player API's answer.
-fn pick(answer: &Value) -> Result<Stream, String> {
+fn pick(answer: &Value, playlist_only: bool) -> Result<Stream, String> {
     let playability = &answer["playabilityStatus"];
     let status = playability["status"].as_str().unwrap_or_default();
     if status != "OK" {
@@ -202,6 +224,9 @@ fn pick(answer: &Value) -> Result<Stream, String> {
     // A broadcast is its playlist: the separate formats are only its latest seconds.
     if let (true, Some(hls)) = (live, &hls) {
         return Ok(stream(hls.clone(), None));
+    }
+    if playlist_only {
+        return hls.map(|hls| stream(hls, None)).ok_or_else(|| "YouTube не дал адресов потоков для этого видео".to_owned());
     }
     let formats = |list: &str| data[list].as_array().map(Vec::as_slice).unwrap_or_default().iter().filter(|f| f["url"].is_string());
     let kind = |f: &Value, kind: &str| f["mimeType"].as_str().is_some_and(|m| m.starts_with(kind));
@@ -314,7 +339,7 @@ mod tests {
                 ],
             },
         });
-        let stream = pick(&answer).unwrap();
+        let stream = pick(&answer, false).unwrap();
         assert_eq!(stream.address, "https://v/137");
         assert_eq!(stream.audio.as_deref(), Some("https://a/251"));
         assert_eq!(stream.title.as_deref(), Some("Кот играет на пианино"));
@@ -330,7 +355,7 @@ mod tests {
                 video(1, "video/webm", 4320, 1), video(2, "video/webm", 1440, 1), audio(3, "audio/mp4", 1),
             ]},
         });
-        assert_eq!(pick(&answer).unwrap().address, "https://v/2");
+        assert_eq!(pick(&answer, false).unwrap().address, "https://v/2");
 
         // A broadcast: its playlist, whatever else is listed.
         let answer = json!({
@@ -341,27 +366,41 @@ mod tests {
                 "adaptiveFormats": [video(137, "video/mp4", 1080, 1), audio(140, "audio/mp4", 1)],
             },
         });
-        let stream = pick(&answer).unwrap();
+        let stream = pick(&answer, false).unwrap();
         assert_eq!((stream.address.as_str(), stream.audio, stream.live), ("https://manifest/live.m3u8", None, true));
+
+        // From the iPhone app only the playlist is taken, even beside separate formats.
+        let answer = json!({
+            "playabilityStatus": {"status": "OK"},
+            "streamingData": {
+                "hlsManifestUrl": "https://manifest/vod.m3u8",
+                "adaptiveFormats": [video(137, "video/mp4", 1080, 1), audio(140, "audio/mp4", 1)],
+            },
+        });
+        let stream = pick(&answer, true).unwrap();
+        assert_eq!((stream.address.as_str(), stream.audio), ("https://manifest/vod.m3u8", None));
+        assert_eq!(pick(&answer, false).unwrap().address, "https://v/137");
+        let no_playlist = json!({"playabilityStatus": {"status": "OK"}, "streamingData": {"adaptiveFormats": [video(137, "video/mp4", 1080, 1)]}});
+        assert!(pick(&no_playlist, true).is_err());
 
         // The iPhone app's answer for a video: a playlist and nothing else usable.
         let answer = json!({"playabilityStatus": {"status": "OK"}, "streamingData": {"hlsManifestUrl": "https://manifest/vod.m3u8"}});
-        assert_eq!(pick(&answer).unwrap().address, "https://manifest/vod.m3u8");
+        assert_eq!(pick(&answer, false).unwrap().address, "https://manifest/vod.m3u8");
 
         // Only the small whole file.
         let answer = json!({
             "playabilityStatus": {"status": "OK"},
             "streamingData": {"formats": [{"itag": 18, "url": "https://whole/18", "mimeType": "video/mp4", "height": 360}]},
         });
-        assert_eq!(pick(&answer).unwrap(), Stream { address: "https://whole/18".into(), audio: None, title: None, live: false });
+        assert_eq!(pick(&answer, false).unwrap(), Stream { address: "https://whole/18".into(), audio: None, title: None, live: false });
 
         // Refusals, in YouTube's words.
         let refused = json!({"playabilityStatus": {"status": "LOGIN_REQUIRED", "reason": "Войдите, чтобы подтвердить свой возраст."}});
-        assert_eq!(pick(&refused).unwrap_err(), "Войдите, чтобы подтвердить свой возраст");
-        assert_eq!(pick(&json!({"playabilityStatus": {"status": "LIVE_STREAM_OFFLINE"}})).unwrap_err(), "трансляция ещё не началась");
-        assert_eq!(pick(&json!({})).unwrap_err(), "видео недоступно");
+        assert_eq!(pick(&refused, false).unwrap_err(), "Войдите, чтобы подтвердить свой возраст");
+        assert_eq!(pick(&json!({"playabilityStatus": {"status": "LIVE_STREAM_OFFLINE"}}), false).unwrap_err(), "трансляция ещё не началась");
+        assert_eq!(pick(&json!({}), false).unwrap_err(), "видео недоступно");
         let empty = json!({"playabilityStatus": {"status": "OK"}, "streamingData": {"adaptiveFormats": [{"signatureCipher": "s=1"}]}});
-        assert!(pick(&empty).is_err());
+        assert!(pick(&empty, false).is_err());
     }
 
     /// `RESUMO_TEST_YOUTUBE=<address> cargo test -- --ignored resolves_a_youtube --nocapture`
