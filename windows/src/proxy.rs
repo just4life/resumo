@@ -40,14 +40,16 @@ fn system(_url: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn system(url: &str) -> Option<String> {
-    let settings = windows::settings()?;
+    let settings = windows::settings().unwrap_or(windows::Settings { script: None, proxy: None });
     // A setup script, when there is one, decides for each address.
     if let Some(script) = &settings.script {
         if let Some(answer) = windows::ask_script(script, url) {
             return answer.as_deref().and_then(from_setting);
         }
     }
-    settings.proxy.as_deref().and_then(from_setting)
+    // Some programs write the proxy only where the system used to keep it:
+    // WinHTTP does not always see it there.
+    settings.proxy.or_else(windows::registry_proxy).as_deref().and_then(from_setting)
 }
 
 #[cfg(windows)]
@@ -92,6 +94,41 @@ mod windows {
         fn WinHttpSetTimeouts(handle: *mut c_void, resolve: i32, connect: i32, send: i32, receive: i32) -> i32;
         fn WinHttpGetProxyForUrl(session: *mut c_void, url: *const u16, options: *mut AutoProxyOptions, info: *mut ProxyInfo) -> i32;
         fn WinHttpCloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegGetValueW(key: isize, subkey: *const u16, value: *const u16, flags: u32, kind: *mut u32, data: *mut c_void, size: *mut u32) -> i32;
+    }
+
+    const HKEY_CURRENT_USER: isize = 0x8000_0001_u32 as i32 as isize;
+    const RRF_RT_REG_SZ: u32 = 0x2;
+    const RRF_RT_REG_DWORD: u32 = 0x10;
+    const INTERNET_SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+
+    /// The proxy as the registry holds it (`ProxyEnable`, `ProxyServer`).
+    pub fn registry_proxy() -> Option<String> {
+        let key = wide(INTERNET_SETTINGS);
+        let mut enabled = 0u32;
+        let mut size = 4u32;
+        // SAFETY: the buffers are ours and as large as `size` says.
+        let read = unsafe {
+            RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), wide("ProxyEnable").as_ptr(), RRF_RT_REG_DWORD, ptr::null_mut(), (&mut enabled as *mut u32).cast(), &mut size)
+        };
+        if read != 0 || enabled == 0 {
+            return None;
+        }
+        let mut text = [0u16; 1024];
+        let mut size = (text.len() * 2) as u32;
+        // SAFETY: as above; the system writes at most `size` bytes.
+        let read = unsafe {
+            RegGetValueW(HKEY_CURRENT_USER, key.as_ptr(), wide("ProxyServer").as_ptr(), RRF_RT_REG_SZ, ptr::null_mut(), text.as_mut_ptr().cast(), &mut size)
+        };
+        if read != 0 {
+            return None;
+        }
+        let length = text.iter().position(|&c| c == 0).unwrap_or(text.len());
+        Some(String::from_utf16_lossy(&text[..length])).filter(|s| !s.trim().is_empty())
     }
 
     #[link(name = "kernel32")]

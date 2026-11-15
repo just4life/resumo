@@ -25,9 +25,16 @@ pub fn request(method: Method, url: &str, headers: &[(&str, &str)], body: Option
     }
     let agent = agent.build();
     // Which way the request went is half of why it failed.
-    let route = |e: String| match &proxy {
-        Some(proxy) => format!("{e}; через прокси {proxy}"),
-        None => format!("{e}; без прокси"),
+    let route = |e: ureq::Error| {
+        // Without the address: the caller knows it, and the message is long as it is.
+        let reason = match &e {
+            ureq::Error::Transport(t) => t.message().map(str::to_owned).unwrap_or_else(|| t.kind().to_string()),
+            other => other.to_string(),
+        };
+        match &proxy {
+            Some(proxy) => format!("через прокси {proxy}: {reason}"),
+            None => format!("без прокси: {reason}"),
+        }
     };
     let mut request = match method {
         Method::Get => agent.get(url),
@@ -43,10 +50,10 @@ pub fn request(method: Method, url: &str, headers: &[(&str, &str)], body: Option
     let response = match result {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(route(e.to_string())),
+        Err(e) => return Err(route(e)),
     };
     let status = response.status();
-    response.into_string().map(|text| (status, text)).map_err(|e| route(e.to_string()))
+    response.into_string().map(|text| (status, text)).map_err(|e| route(e.into()))
 }
 
 /// A connection to read from and write to.
