@@ -809,6 +809,138 @@ pub fn http_request(post: bool, url: &str, headers: &[(&str, &str)], body: Optio
     .ok_or_else(|| "нет соединения".to_owned())
 }
 
+/// An encrypted connection made by Android's own TLS (`SSLSocket`), with
+/// the system's certificates. Closed when dropped.
+pub struct TlsSocket {
+    socket: GlobalRef,
+    input: GlobalRef,
+    output: GlobalRef,
+    /// A Java byte array the reads and writes go through.
+    buffer: GlobalRef,
+}
+
+const TLS_BUFFER: usize = 8 * 1024;
+
+/// Opens an encrypted connection to `host`; a read that gets nothing for
+/// `read_timeout` fails with `TimedOut`. Blocks, so not for the UI thread.
+pub fn tls_connect(host: &str, port: u16, read_timeout: Duration) -> Result<TlsSocket, String> {
+    const CONNECT_MS: i32 = 10_000;
+    with_env(|env, _| {
+        let factory = env
+            .call_static_method("javax/net/ssl/SSLSocketFactory", "getDefault", "()Ljavax/net/SocketFactory;", &[])?
+            .l()?;
+        // A plain connection first, so that connecting has a time limit; TLS
+        // goes over it, told the host's name for the handshake and the check.
+        let plain = env.new_object("java/net/Socket", "()V", &[])?;
+        let name = env.new_string(host)?;
+        let address = env.new_object(
+            "java/net/InetSocketAddress",
+            "(Ljava/lang/String;I)V",
+            &[JValue::Object(&name), JValue::Int(i32::from(port))],
+        )?;
+        let connect = [JValue::Object(&address), JValue::Int(CONNECT_MS)];
+        env.call_method(&plain, "connect", "(Ljava/net/SocketAddress;I)V", &connect)?;
+        env.call_method(&plain, "setSoTimeout", "(I)V", &[JValue::Int(CONNECT_MS)])?;
+        let over = [JValue::Object(&plain), JValue::Object(&name), JValue::Int(i32::from(port)), JValue::Bool(1)];
+        let socket = env
+            .call_method(&factory, "createSocket", "(Ljava/net/Socket;Ljava/lang/String;IZ)Ljava/net/Socket;", &over)?
+            .l()?;
+        // An SSLSocket checks the certificate's chain but not whose it is,
+        // unless told to: without this any valid certificate would pass.
+        let params = env.call_method(&socket, "getSSLParameters", "()Ljavax/net/ssl/SSLParameters;", &[])?.l()?;
+        let https = env.new_string("HTTPS")?;
+        env.call_method(&params, "setEndpointIdentificationAlgorithm", "(Ljava/lang/String;)V", &[JValue::Object(&https)])?;
+        env.call_method(&socket, "setSSLParameters", "(Ljavax/net/ssl/SSLParameters;)V", &[JValue::Object(&params)])?;
+        env.call_method(&socket, "startHandshake", "()V", &[])?;
+        let wait = read_timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+        env.call_method(&socket, "setSoTimeout", "(I)V", &[JValue::Int(wait)])?;
+        let input = env.call_method(&socket, "getInputStream", "()Ljava/io/InputStream;", &[])?.l()?;
+        let output = env.call_method(&socket, "getOutputStream", "()Ljava/io/OutputStream;", &[])?.l()?;
+        let buffer = env.new_byte_array(TLS_BUFFER as i32)?;
+        Ok(TlsSocket {
+            socket: env.new_global_ref(socket)?,
+            input: env.new_global_ref(input)?,
+            output: env.new_global_ref(output)?,
+            buffer: env.new_global_ref(buffer)?,
+        })
+    })
+    .ok_or_else(|| "нет соединения".to_owned())
+}
+
+impl TlsSocket {
+    /// Runs `f` with a JNI env; a Java exception becomes an error: `TimedOut`
+    /// for a read that waited its time out, `Other` for the rest.
+    fn java<R>(&self, f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<R>) -> std::io::Result<R> {
+        use std::io::{Error, ErrorKind};
+        let vm = vm();
+        let mut env = vm.attach_current_thread_permanently().map_err(Error::other)?;
+        let result = env.with_local_frame(8, |env| f(env));
+        if env.exception_check().unwrap_or(false) {
+            let timed_out = env
+                .exception_occurred()
+                .and_then(|thrown| {
+                    env.exception_clear()?;
+                    env.is_instance_of(&thrown, "java/net/SocketTimeoutException")
+                })
+                .unwrap_or(false);
+            let _ = env.exception_clear();
+            return Err(if timed_out { ErrorKind::TimedOut.into() } else { Error::other("соединение прервано") });
+        }
+        result.map_err(Error::other)
+    }
+}
+
+impl std::io::Read for TlsSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let wanted = buf.len().min(TLS_BUFFER);
+        if wanted == 0 {
+            return Ok(0);
+        }
+        let mut chunk = vec![0i8; wanted];
+        let n = self.java(|env| {
+            let args = [JValue::Object(self.buffer.as_obj()), JValue::Int(0), JValue::Int(wanted as i32)];
+            let n = env.call_method(self.input.as_obj(), "read", "([BII)I", &args)?.i()?;
+            if n > 0 {
+                // SAFETY: `buffer` is the byte array made in `tls_connect`; the
+                // wrapper only borrows the reference and never frees it.
+                let array = unsafe { jni::objects::JByteArray::from_raw(self.buffer.as_obj().as_raw()) };
+                env.get_byte_array_region(&array, 0, &mut chunk[..n as usize])?;
+            }
+            Ok(n)
+        })?;
+        // -1 is the end of the stream.
+        let n = n.max(0) as usize;
+        buf[..n].iter_mut().zip(&chunk).for_each(|(to, from)| *to = *from as u8);
+        Ok(n)
+    }
+}
+
+impl std::io::Write for TlsSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(TLS_BUFFER);
+        let chunk: Vec<i8> = buf[..n].iter().map(|&b| b as i8).collect();
+        self.java(|env| {
+            // SAFETY: as in `read`.
+            let array = unsafe { jni::objects::JByteArray::from_raw(self.buffer.as_obj().as_raw()) };
+            env.set_byte_array_region(&array, 0, &chunk)?;
+            let args = [JValue::Object(self.buffer.as_obj()), JValue::Int(0), JValue::Int(n as i32)];
+            env.call_method(self.output.as_obj(), "write", "([BII)V", &args)?;
+            Ok(())
+        })?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.java(|env| env.call_method(self.output.as_obj(), "flush", "()V", &[]).map(|_| ()))
+    }
+}
+
+impl Drop for TlsSocket {
+    fn drop(&mut self) {
+        let _ = self.java(|env| env.call_method(self.socket.as_obj(), "close", "()V", &[]).map(|_| ()));
+    }
+}
+
 pub fn clipboard_text() -> Option<String> {
     with_env(|env, activity| {
         let name = env.new_string("clipboard")?;

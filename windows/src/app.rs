@@ -12,6 +12,7 @@ use egui::{
 };
 
 use crate::clip::{self, Marks};
+use crate::chat;
 use crate::crop::{self, Crop};
 use crate::hdr::{self, HdrInfo, Transfer};
 use crate::hdr_gl;
@@ -210,6 +211,12 @@ pub struct PlayerApp {
     /// A Twitch channel is about to play: its location in the playlist, and
     /// where the address of its stream arrives from the thread asking Twitch.
     resolving: Option<(String, mpsc::Receiver<Result<String, String>>)>,
+    /// The chat of the Twitch channel being played, unless it is turned off.
+    pub(crate) chat: Option<chat::Chat>,
+    pub(crate) chat_log: chat::Log,
+    /// The chat has the playlist's place this frame (otherwise it is drawn
+    /// over the video).
+    chat_in_panel: bool,
 }
 
 impl PlayerApp {
@@ -305,6 +312,9 @@ impl PlayerApp {
             live: live::Detector::default(),
             clock: Instant::now(),
             resolving: None,
+            chat: None,
+            chat_log: chat::Log::default(),
+            chat_in_panel: false,
         };
         app.player.set_subtitle_scale(app.subtitle_scale);
         app.add_paths(files, true);
@@ -1020,6 +1030,7 @@ impl PlayerApp {
 
     fn poll(&mut self, ctx: &egui::Context) {
         self.poll_resolving();
+        self.poll_chat();
         if self.events.playing.swap(false, Ordering::SeqCst) {
             // The audio output exists only once playback started.
             self.player.set_volume(self.volume);
@@ -1617,6 +1628,11 @@ impl PlayerApp {
                     {
                         self.toggle_playlist();
                     }
+                    if self.twitch_channel().is_some()
+                        && theme::icon_button(ui, Icon::Chat, "Чат Twitch", !self.store.chat_off).clicked()
+                    {
+                        self.toggle_chat();
+                    }
                     theme::menu_icon(ui, Icon::Folder, "Открыть", false, |ui| self.open_menu(ui));
                 });
                 theme::capsule(ui, |ui| {
@@ -1920,11 +1936,132 @@ impl PlayerApp {
         }
     }
 
+    // ------------------------------------------------------------------- chat
+
+    /// The Twitch channel being played, if the current video is one.
+    pub(crate) fn twitch_channel(&self) -> Option<String> {
+        self.playlist.current.and_then(|i| self.playlist.items.get(i)).and_then(|item| twitch::channel(&item.location))
+    }
+
+    /// Keeps the chat connected to the channel being played, while the chat
+    /// is wanted, and takes what was said in it.
+    fn poll_chat(&mut self) {
+        let wanted = if self.store.chat_off { None } else { self.twitch_channel() };
+        if self.chat.as_ref().map(|c| c.channel()) != wanted.as_deref() {
+            self.chat_log = chat::Log::default();
+            self.chat = wanted.map(|channel| {
+                let ctx = self.events.repaint.lock().unwrap().clone();
+                chat::Chat::open(&channel, move || {
+                    if let Some(ctx) = &ctx {
+                        ctx.request_repaint();
+                    }
+                })
+            });
+        }
+        if let Some(chat) = &self.chat {
+            for event in chat.events() {
+                self.chat_log.apply(event);
+            }
+        }
+    }
+
+    pub(crate) fn toggle_chat(&mut self) {
+        let off = !self.store.chat_off;
+        self.store.set_chat_off(off);
+        self.store.save();
+        self.notify(if off { "Чат Twitch скрыт" } else { "Чат Twitch показан" });
+    }
+
+    /// One message as text: the author in their colour, then what they said.
+    fn chat_line(message: &chat::Message, size: f32, width: f32) -> egui::text::LayoutJob {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = width;
+        let font = FontId::proportional(size);
+        let [r, g, b] = message.color;
+        job.append(&message.name, 0.0, egui::TextFormat::simple(font.clone(), Color32::from_rgb(r, g, b)));
+        job.append(&format!(": {}", message.text), 0.0, egui::TextFormat::simple(font, theme::TEXT));
+        job
+    }
+
+    /// The chat in the playlist's place.
+    fn chat_panel(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Чат").strong().size(15.0).color(theme::TEXT));
+            if let Some(chat) = &self.chat {
+                ui.label(RichText::new(chat.channel()).color(theme::TEXT_DIM));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if theme::icon_button(ui, Icon::Playlist, "Плейлист вместо чата", false).clicked() {
+                    self.toggle_chat();
+                }
+            });
+        });
+        ui.add_space(6.0);
+        let log = &self.chat_log;
+        let status = match (&log.trouble, log.connected, log.messages.is_empty()) {
+            (Some(why), ..) => Some(format!("Чат недоступен: {why}. Пробую ещё раз…")),
+            (None, false, _) => Some("Подключаюсь к чату…".to_owned()),
+            (None, true, true) => Some("В чате пока тихо".to_owned()),
+            (None, true, false) => None,
+        };
+        if let Some(status) = status {
+            ui.label(RichText::new(status).color(theme::TEXT_DIM));
+            ui.add_space(4.0);
+        }
+        egui::ScrollArea::vertical().auto_shrink(false).stick_to_bottom(true).show(ui, |ui| {
+            let width = ui.available_width();
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for message in &self.chat_log.messages {
+                ui.label(Self::chat_line(message, 14.0, width));
+            }
+        });
+    }
+
+    /// The latest of the chat as lines of text, the newest at the bottom of
+    /// `area` and as many above it as fit. Nothing in it takes touches.
+    pub(crate) fn paint_chat(&self, p: &egui::Painter, area: Rect, size: f32) {
+        const LINES: usize = 12;
+        let mut bottom = area.bottom();
+        for message in self.chat_log.messages.iter().rev().take(LINES) {
+            let galley = p.layout_job(Self::chat_line(message, size, area.width() - 16.0));
+            let back = Rect::from_min_size(pos2(area.left(), bottom - galley.size().y - 6.0), galley.size() + vec2(16.0, 6.0));
+            if back.top() < area.top() {
+                break;
+            }
+            // Dark behind the text: the video may be of any brightness.
+            p.rect_filled(back, 6.0, Color32::from_black_alpha(130));
+            p.galley(back.min + vec2(8.0, 3.0), galley, theme::TEXT);
+            bottom = back.top() - 3.0;
+        }
+    }
+
+    /// The chat over the video, at its left above the control bar.
+    fn chat_overlay(&self, ui: &Ui, rect: Rect) {
+        if self.chat.is_none() || self.chat_in_panel {
+            return;
+        }
+        // Clear of the camera cutout, where the screen has one.
+        let safe = rect.intersect(ui.ctx().content_rect());
+        let bar_h = 78.0;
+        let width = (safe.width() * 0.36).clamp(220.0, 460.0).min(safe.width() - 24.0);
+        let bottom = safe.bottom() - bar_h - 10.0;
+        let left = safe.left() + 12.0;
+        let area = Rect::from_min_max(pos2(left, bottom - safe.height() * 0.45), pos2(left + width, bottom));
+        self.paint_chat(&ui.painter_at(rect), area, 14.0);
+    }
+
     fn playlist_panel(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Плейлист").strong().size(15.0).color(theme::TEXT));
             ui.label(RichText::new(format!("{}", self.playlist.items.len())).color(theme::TEXT_DIM));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // The chat was turned off: the way back to it.
+                if self.store.chat_off
+                    && self.twitch_channel().is_some()
+                    && theme::icon_button(ui, Icon::Chat, "Чат Twitch", false).clicked()
+                {
+                    self.toggle_chat();
+                }
                 theme::menu_icon(ui, Icon::More, "Действия", false, |ui| {
                     if ui.button("Добавить файлы…").clicked() {
                         ui.close();
@@ -2170,6 +2307,7 @@ impl PlayerApp {
         });
         ctx.global_style_mut(|s| s.visuals.window_fill = solid);
 
+        self.chat_overlay(ui, rect);
         self.overlay_controls(ui, ctx, rect);
         self.clip_panel(ui, ctx, rect);
         let info_bottom = self.info_overlay(ui, ctx, rect);
@@ -2317,6 +2455,9 @@ impl eframe::App for PlayerApp {
                 .show_separator_line(false)
                 .show(ui, |ui| self.title_bar(ui, &ctx));
         }
+        // With the playlist open the chat takes its place; otherwise it is
+        // drawn over the video.
+        self.chat_in_panel = self.show_playlist && !self.fullscreen && self.chat.is_some();
         if self.show_playlist && !self.fullscreen {
             egui::Panel::right("playlist")
                 .resizable(true)
@@ -2328,7 +2469,7 @@ impl eframe::App for PlayerApp {
                         .inner_margin(Margin::same(10))
                         .stroke(Stroke::new(1.0, theme::BORDER)),
                 )
-                .show(ui, |ui| self.playlist_panel(ui));
+                .show(ui, |ui| if self.chat_in_panel { self.chat_panel(ui) } else { self.playlist_panel(ui) });
         }
         egui::CentralPanel::no_frame().show(ui, |ui| self.video_area(ui, &ctx));
         self.fit_window(frame, &ctx);

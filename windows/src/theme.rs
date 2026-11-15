@@ -88,6 +88,8 @@ pub enum Icon {
     Plus,
     /// A link to a stream.
     Link,
+    /// The chat of a Twitch stream.
+    Chat,
     Close,
     Minimize,
     Maximize,
@@ -231,6 +233,21 @@ pub fn paint_icon(p: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 pt(8.5, 6.5),
                 pt(-8.5, 6.5),
             ]);
+        }
+        Icon::Chat => {
+            // A speech bubble with its tail at the bottom left, two lines in it.
+            line(vec![
+                pt(-8.0, -7.5),
+                pt(8.0, -7.5),
+                pt(8.0, 4.0),
+                pt(-2.0, 4.0),
+                pt(-6.0, 8.0),
+                pt(-6.0, 4.0),
+                pt(-8.0, 4.0),
+                pt(-8.0, -7.5),
+            ]);
+            line(vec![pt(-4.5, -3.5), pt(4.5, -3.5)]);
+            line(vec![pt(-4.5, 0.0), pt(1.5, 0.0)]);
         }
         Icon::Link => {
             // Two chain links on the diagonal.
