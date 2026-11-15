@@ -171,6 +171,7 @@ VLC_LIB_DIR=/путь/к/VideoLAN.LibVLC.Windows/build/x64 sh installer/build-wi
 | `src/twitch.rs` | адрес потока по ссылке на канал Twitch |
 | `src/youtube.rs` | адрес потока по ссылке на видео, эфир или канал YouTube |
 | `src/sites.rs` | какой сайт стоит за ссылкой и как получить его поток |
+| `src/relay.rs` | отдаёт libVLC файл, лежащий за прокси (сам libVLC на Windows прокси для HTTPS-файлов не использует) |
 | `src/proxy.rs` | прокси из окружения или настроек системы |
 | `src/chat.rs` | чат Twitch: подключение (IRC поверх WebSocket), разбор сообщений |
 | `src/http.rs` | HTTPS-запросы самого плеера (запросы через `ureq`) |
