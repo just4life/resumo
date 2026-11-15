@@ -233,7 +233,11 @@ impl PlayerApp {
 
         let hdr_gl = cc.gl.as_ref().and_then(|gl| hdr_gl::Renderer::new(gl)).map(|r| Arc::new(Mutex::new(r)));
 
-        let instance = Instance::new(&["--no-video-title-show", "--quiet"])?;
+        // libVLC does not look at the system's proxy itself.
+        let proxy = crate::proxy::for_url("https://www.youtube.com/").map(|p| format!("--http-proxy=http://{p}"));
+        let mut args = vec!["--no-video-title-show", "--quiet"];
+        args.extend(proxy.as_deref());
+        let instance = Instance::new(&args)?;
         let player = MediaPlayer::new(&instance)?;
 
         let ctx = cc.egui_ctx.clone();

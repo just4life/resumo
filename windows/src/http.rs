@@ -16,7 +16,13 @@ pub enum Method {
 /// Blocks: call it off the UI thread.
 pub fn request(method: Method, url: &str, headers: &[(&str, &str)], body: Option<&str>) -> Result<(u16, String), String> {
     // The system's certificates and proxy, so it works wherever a browser does.
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).try_proxy_from_env(true).build();
+    let mut agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).try_proxy_from_env(true);
+    if crate::proxy::from_environment().is_none() {
+        if let Some(proxy) = crate::proxy::for_url(url) {
+            agent = agent.proxy(ureq::Proxy::new(format!("http://{proxy}")).map_err(|e| e.to_string())?);
+        }
+    }
+    let agent = agent.build();
     let mut request = match method {
         Method::Get => agent.get(url),
         Method::Post => agent.post(url),
@@ -45,12 +51,12 @@ impl<T: Read + Write + Send> Stream for T {}
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Opens an encrypted connection to `host`, through the proxy the
-/// environment names if there is one. Reads that get nothing for
+/// environment or the system names if there is one. Reads that get nothing for
 /// `read_timeout` fail with `WouldBlock` or `TimedOut` and may be repeated.
 /// Blocks: call it off the UI thread.
 pub fn tls_connect(host: &str, port: u16, read_timeout: Duration) -> Result<Box<dyn Stream>, String> {
     let text = |e: io::Error| e.to_string();
-    let tcp = match proxy() {
+    let tcp = match crate::proxy::for_url(&format!("https://{host}/")) {
         Some(proxy) => through_proxy(&proxy, host, port).map_err(text)?,
         None => dial(&format!("{host}:{port}")).map_err(text)?,
     };
@@ -70,16 +76,6 @@ fn dial(address: &str) -> io::Result<TcpStream> {
         }
     }
     Err(last)
-}
-
-/// The HTTPS proxy from the environment, as `host:port`.
-fn proxy() -> Option<String> {
-    let value = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"].iter().find_map(|name| std::env::var(name).ok())?;
-    let value = value.trim();
-    let rest = value.strip_prefix("http://").unwrap_or(value);
-    // Other kinds of proxy (socks) are not spoken here.
-    let address = rest.split('/').next().unwrap_or_default().rsplit('@').next().unwrap_or_default();
-    (!address.is_empty() && !rest.contains("://")).then(|| address.to_owned())
 }
 
 /// Asks the proxy for a tunnel to `host:port`.

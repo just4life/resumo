@@ -14,6 +14,7 @@ mod http;
 mod info;
 mod live;
 mod playlist;
+mod proxy;
 mod sites;
 mod snapshot;
 mod store;
