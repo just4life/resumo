@@ -46,6 +46,10 @@ public final class Playback {
     private static Bitmap art;
     private static String title = "", subtitle = "";
     private static boolean playing, active;
+    private static long positionMs, lengthMs = -1;
+    /** Position in steps of PROGRESS_STEP_MS, as last shown in the notification. */
+    private static long shownStep = -1;
+    private static final long PROGRESS_STEP_MS = 5000;
     private static Handler main;
     private static AudioManager audio;
     private static AudioFocusRequest focusRequest;
@@ -145,6 +149,8 @@ public final class Playback {
                 title = t;
                 subtitle = sub;
                 playing = isPlaying;
+                positionMs = position;
+                lengthMs = length;
                 MediaMetadata.Builder meta = new MediaMetadata.Builder()
                         .putString(MediaMetadata.METADATA_KEY_TITLE, t)
                         .putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, t)
@@ -167,7 +173,14 @@ public final class Playback {
                     active = true;
                     session.setActive(true);
                 }
+                long step = length > 0 ? position / PROGRESS_STEP_MS : -1;
+                if (!changed && step != shownStep) {
+                    // Only the progress bar moved: no need to poke the service.
+                    shownStep = step;
+                    PlaybackService.refresh(app);
+                }
                 if (changed) {
+                    shownStep = step;
                     Intent svc = new Intent(app, PlaybackService.class);
                     try {
                         if (Build.VERSION.SDK_INT >= 26) app.startForegroundService(svc);
@@ -202,7 +215,7 @@ public final class Playback {
 
     static Notification notification(Context ctx) {
         Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(ctx, CHANNEL) : new Notification.Builder(ctx);
-        b.setSmallIcon(android.R.drawable.ic_media_play)
+        b.setSmallIcon(icon(ctx, "ic_np_play", android.R.drawable.ic_media_play))
                 .setContentTitle(title)
                 .setContentText(subtitle)
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
@@ -211,11 +224,14 @@ public final class Playback {
                 .setOnlyAlertOnce(true)
                 .setOngoing(playing)
                 .setShowWhen(false)
-                .addAction(button(ctx, android.R.drawable.ic_media_previous, "Назад", PREV))
-                .addAction(playing ? button(ctx, android.R.drawable.ic_media_pause, "Пауза", PAUSE)
-                                   : button(ctx, android.R.drawable.ic_media_play, "Играть", PLAY))
-                .addAction(button(ctx, android.R.drawable.ic_media_next, "Вперёд", NEXT))
+                .addAction(button(ctx, icon(ctx, "ic_np_prev", android.R.drawable.ic_media_previous), "Назад", PREV))
+                .addAction(playing ? button(ctx, icon(ctx, "ic_np_pause", android.R.drawable.ic_media_pause), "Пауза", PAUSE)
+                                   : button(ctx, icon(ctx, "ic_np_play", android.R.drawable.ic_media_play), "Играть", PLAY))
+                .addAction(button(ctx, icon(ctx, "ic_np_next", android.R.drawable.ic_media_next), "Вперёд", NEXT))
                 .setDeleteIntent(PlaybackService.intent(ctx, STOP));
+        // Stock Android draws the bar from the session; skins with their own
+        // media layout (Vivo) may only know the notification's own progress.
+        if (lengthMs > 0) b.setProgress(1000, (int) Math.max(0, Math.min(1000, positionMs * 1000 / lengthMs)), false);
         if (art != null) b.setLargeIcon(art);
         if (session != null) {
             b.setStyle(new Notification.MediaStyle().setMediaSession(session.getSessionToken()).setShowActionsInCompactView(0, 1, 2));
@@ -226,6 +242,17 @@ public final class Playback {
     }
 
     private static Notification.Action button(Context ctx, int icon, String label, int code) {
-        return new Notification.Action.Builder(icon, label, PlaybackService.intent(ctx, code)).build();
+        return new Notification.Action.Builder(android.graphics.drawable.Icon.createWithResource(ctx, icon), label,
+                PlaybackService.intent(ctx, code)).build();
+    }
+
+    /**
+     * The app's own sharp vector icon (res/drawable), by name: the build has
+     * no generated R class. The system's old bitmap icons look blurred on
+     * today's screens, so they are only the fallback.
+     */
+    private static int icon(Context ctx, String name, int fallback) {
+        int id = ctx.getResources().getIdentifier(name, "drawable", ctx.getPackageName());
+        return id != 0 ? id : fallback;
     }
 }
