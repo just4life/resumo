@@ -245,7 +245,11 @@ impl PlayerApp {
         args.extend(proxy.as_deref());
         let instance = Instance::new(&args)?;
         if let Some(file) = &log {
-            let _ = instance.log_to(file);
+            let route = match &proxy {
+                Some(_) => format!("Resumo: libVLC goes through the proxy {}", crate::proxy::for_url("https://www.youtube.com/").map(|p| p.address).unwrap_or_default()),
+                None => "Resumo: no proxy found, libVLC connects directly".to_owned(),
+            };
+            let _ = instance.log_to(file, &route);
         }
         let player = MediaPlayer::new(&instance)?;
 

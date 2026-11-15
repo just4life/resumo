@@ -315,8 +315,10 @@ impl Instance {
 
 impl Instance {
     /// Has libVLC write what it does into `path`, for as long as it lives.
-    pub fn log_to(&self, path: &str) -> std::io::Result<()> {
-        let file = std::fs::File::create(path)?;
+    pub fn log_to(&self, path: &str, first_line: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        writeln!(file, "{first_line}")?;
         let data = Box::leak(Box::new(std::sync::Mutex::new(file)));
         // SAFETY: the callback and its file outlive the instance.
         unsafe { libvlc_log_set(self.raw, write_log, (data as *mut std::sync::Mutex<std::fs::File>).cast()) };
