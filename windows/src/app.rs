@@ -234,10 +234,17 @@ impl PlayerApp {
         let hdr_gl = cc.gl.as_ref().and_then(|gl| hdr_gl::Renderer::new(gl)).map(|r| Arc::new(Mutex::new(r)));
 
         // libVLC does not look at the system's proxy itself.
-        let proxy = crate::proxy::for_url("https://www.youtube.com/").map(|p| format!("--http-proxy=http://{p}"));
-        let mut args = vec!["--no-video-title-show", "--quiet"];
+        crate::proxy::configure(store.proxy.as_deref());
+        let proxy = crate::proxy::for_url("https://www.youtube.com/").map(|p| format!("--http-proxy={}", p.url()));
+        // RESUMO_VLC_LOG=<file> has libVLC write down what it does, to find
+        // out why something does not play.
+        let log = std::env::var("RESUMO_VLC_LOG").ok().filter(|f| !f.is_empty());
+        let mut args = vec!["--no-video-title-show", if log.is_some() { "--verbose=2" } else { "--quiet" }];
         args.extend(proxy.as_deref());
         let instance = Instance::new(&args)?;
+        if let Some(file) = &log {
+            let _ = instance.log_to(file);
+        }
         let player = MediaPlayer::new(&instance)?;
 
         let ctx = cc.egui_ctx.clone();

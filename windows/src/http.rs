@@ -16,12 +16,10 @@ pub enum Method {
 /// Blocks: call it off the UI thread.
 pub fn request(method: Method, url: &str, headers: &[(&str, &str)], body: Option<&str>) -> Result<(u16, String), String> {
     // The system's certificates and proxy, so it works wherever a browser does.
-    let mut agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).try_proxy_from_env(true);
+    let mut agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15));
     let proxy = crate::proxy::for_url(url);
-    if crate::proxy::from_environment().is_none() {
-        if let Some(proxy) = &proxy {
-            agent = agent.proxy(ureq::Proxy::new(format!("http://{proxy}")).map_err(|e| e.to_string())?);
-        }
+    if let Some(proxy) = &proxy {
+        agent = agent.proxy(ureq::Proxy::new(proxy.url()).map_err(|e| e.to_string())?);
     }
     let agent = agent.build();
     // Which way the request went is half of why it failed.
@@ -32,7 +30,7 @@ pub fn request(method: Method, url: &str, headers: &[(&str, &str)], body: Option
             other => other.to_string(),
         };
         match &proxy {
-            Some(proxy) => format!("через прокси {proxy}: {reason}"),
+            Some(proxy) => format!("через прокси {}: {reason}", proxy.address),
             None => format!("без прокси: {reason}"),
         }
     };
@@ -92,10 +90,11 @@ fn dial(address: &str) -> io::Result<TcpStream> {
 }
 
 /// Asks the proxy for a tunnel to `host:port`.
-fn through_proxy(proxy: &str, host: &str, port: u16) -> io::Result<TcpStream> {
-    let mut tcp = dial(proxy)?;
+fn through_proxy(proxy: &crate::proxy::Proxy, host: &str, port: u16) -> io::Result<TcpStream> {
+    let mut tcp = dial(&proxy.address)?;
     tcp.set_read_timeout(Some(CONNECT_TIMEOUT))?;
-    tcp.write_all(format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes())?;
+    let login = proxy.authorization().map(|a| format!("Proxy-Authorization: {a}\r\n")).unwrap_or_default();
+    tcp.write_all(format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n{login}\r\n").as_bytes())?;
     // The answer byte by byte, so as not to take any of what follows it.
     let mut head = Vec::new();
     let mut byte = [0u8; 1];

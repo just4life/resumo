@@ -40,6 +40,9 @@ pub struct Store {
     positions: Vec<(String, i64)>,
     pub volume: Option<i32>,
     pub audio_device: Option<String>,
+    /// The proxy to go through instead of the system's: `host:port` or
+    /// `http://user:password@host:port`. Written by hand.
+    pub proxy: Option<String>,
     /// The user turned off the chat shown with Twitch streams.
     pub chat_off: bool,
     /// The user turned off our HDR → SDR conversion.
@@ -75,6 +78,7 @@ impl Store {
                 match line.split_once('=') {
                     Some(("volume", v)) => store.volume = v.trim().parse().ok(),
                     Some(("audio_device", v)) if !v.is_empty() => store.audio_device = Some(v.to_owned()),
+                    Some(("proxy", v)) if !v.trim().is_empty() => store.proxy = Some(v.trim().to_owned()),
                     Some(("twitch_chat", v)) => store.chat_off = v.trim() == "off",
                     Some(("hdr_to_sdr", v)) => store.hdr_off = v.trim() == "off",
                     Some(("hdr_brightness", v)) => store.hdr_brightness = v.trim().parse().ok(),
@@ -188,6 +192,9 @@ impl Store {
         }
         if let Some(d) = &self.audio_device {
             settings.push_str(&format!("audio_device={d}\n"));
+        }
+        if let Some(p) = &self.proxy {
+            settings.push_str(&format!("proxy={p}\n"));
         }
         if self.chat_off {
             settings.push_str("twitch_chat=off\n");

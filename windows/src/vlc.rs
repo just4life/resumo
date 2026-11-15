@@ -145,6 +145,7 @@ extern "C" {
     fn libvlc_release(inst: *mut libvlc_instance_t);
     fn libvlc_errmsg() -> *const c_char;
     fn libvlc_get_version() -> *const c_char;
+    fn libvlc_log_set(inst: *mut libvlc_instance_t, callback: LogCallback, data: *mut c_void);
 
     fn libvlc_media_new_path(inst: *mut libvlc_instance_t, path: *const c_char) -> *mut libvlc_media_t;
     fn libvlc_media_new_location(inst: *mut libvlc_instance_t, mrl: *const c_char) -> *mut libvlc_media_t;
@@ -266,6 +267,30 @@ fn last_error() -> String {
     }
 }
 
+/// libVLC's log callback; `args` is a C `va_list`, which both ABIs built
+/// for here pass as one pointer.
+type LogCallback = unsafe extern "C" fn(data: *mut c_void, level: c_int, context: *const c_void, format: *const c_char, args: *mut c_void);
+
+extern "C" {
+    // The C99 one: the Windows runtime's own does not know all of libVLC's formats.
+    #[cfg_attr(windows, link_name = "__mingw_vsnprintf")]
+    fn vsnprintf(buffer: *mut c_char, size: usize, format: *const c_char, args: *mut c_void) -> c_int;
+}
+
+unsafe extern "C" fn write_log(data: *mut c_void, level: c_int, _context: *const c_void, format: *const c_char, args: *mut c_void) {
+    use std::io::Write;
+    let mut line = [0u8; 2048];
+    // SAFETY: libVLC gives a format and the arguments that go with it; the
+    // buffer is ours and its size is passed.
+    let length = unsafe { vsnprintf(line.as_mut_ptr().cast(), line.len(), format, args) };
+    let length = (length.max(0) as usize).min(line.len() - 1);
+    // SAFETY: `data` is the file leaked by `Instance::log_to`.
+    let file = unsafe { &*data.cast::<std::sync::Mutex<std::fs::File>>() };
+    if let Ok(mut file) = file.lock() {
+        let _ = writeln!(file, "[{level}] {}", String::from_utf8_lossy(&line[..length]));
+    }
+}
+
 pub fn version() -> String {
     unsafe { CStr::from_ptr(libvlc_get_version()).to_string_lossy().into_owned() }
 }
@@ -285,6 +310,17 @@ impl Instance {
         } else {
             Ok(Self { raw })
         }
+    }
+}
+
+impl Instance {
+    /// Has libVLC write what it does into `path`, for as long as it lives.
+    pub fn log_to(&self, path: &str) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        let data = Box::leak(Box::new(std::sync::Mutex::new(file)));
+        // SAFETY: the callback and its file outlive the instance.
+        unsafe { libvlc_log_set(self.raw, write_log, (data as *mut std::sync::Mutex<std::fs::File>).cast()) };
+        Ok(())
     }
 }
 

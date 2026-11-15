@@ -1,45 +1,103 @@
 //! The proxy to go through: the one the environment names, or else the one
 //! set in the system (Windows: Settings -> Network -> Proxy, including a
-//! setup script). Only HTTP proxies; a SOCKS one is not spoken here.
+//! setup script), unless the player's own settings name one. Only HTTP
+//! proxies; a SOCKS one is not spoken here.
 
-/// The proxy for an HTTPS request to `url` as `host:port`, or `None` to
-/// connect directly. May ask the system's setup script: call it off the UI
-/// thread where a wait matters.
-pub fn for_url(url: &str) -> Option<String> {
-    from_environment().or_else(|| system(url))
+use std::sync::OnceLock;
+
+/// A proxy to go through.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Proxy {
+    /// `host:port`.
+    pub address: String,
+    /// The name and password it asks for.
+    pub login: Option<(String, String)>,
 }
 
-/// Whether the environment names a proxy (it wins over the system's).
-pub fn from_environment() -> Option<String> {
+impl Proxy {
+    /// As a URL, with the login in it.
+    pub fn url(&self) -> String {
+        match &self.login {
+            Some((name, password)) => format!("http://{name}:{password}@{}", self.address),
+            None => format!("http://{}", self.address),
+        }
+    }
+
+    /// The `Proxy-Authorization` value, when the proxy wants a login.
+    pub fn authorization(&self) -> Option<String> {
+        let (name, password) = self.login.as_ref()?;
+        Some(format!("Basic {}", base64(format!("{name}:{password}").as_bytes())))
+    }
+}
+
+/// The proxy written in the player's settings (`proxy=` in settings.txt).
+static CONFIGURED: OnceLock<Option<Proxy>> = OnceLock::new();
+
+/// Takes the proxy from the player's settings; it wins over the others.
+/// Call once, before the first request.
+pub fn configure(setting: Option<&str>) {
+    let _ = CONFIGURED.set(setting.and_then(parse));
+}
+
+/// The proxy for an HTTPS request to `url`, or `None` to connect directly.
+/// May ask the system's setup script: call it off the UI thread where a
+/// wait matters.
+pub fn for_url(url: &str) -> Option<Proxy> {
+    CONFIGURED.get().cloned().flatten().or_else(from_environment).or_else(|| system(url))
+}
+
+/// The proxy the environment names (it wins over the system's).
+fn from_environment() -> Option<Proxy> {
     let value = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"].iter().find_map(|name| std::env::var(name).ok())?;
-    address(value.trim())
+    parse(value.trim())
 }
 
-/// `host:port` out of `http://user@host:port/`; nothing for other schemes.
-fn address(value: &str) -> Option<String> {
-    let rest = value.strip_prefix("http://").unwrap_or(value);
-    let address = rest.split('/').next().unwrap_or_default().rsplit('@').next().unwrap_or_default();
-    (!address.is_empty() && !rest.contains("://")).then(|| address.to_owned())
+/// A proxy out of `http://user:password@host:port/` or `host:port`;
+/// nothing for other schemes.
+fn parse(value: &str) -> Option<Proxy> {
+    let rest = value.trim().strip_prefix("http://").unwrap_or(value.trim());
+    if rest.contains("://") {
+        return None;
+    }
+    let rest = rest.split('/').next().unwrap_or_default();
+    let (login, address) = match rest.rsplit_once('@') {
+        Some((login, address)) => (Some(login), address),
+        None => (None, rest),
+    };
+    let login = login.map(|l| l.split_once(':').unwrap_or((l, ""))).map(|(n, p)| (n.to_owned(), p.to_owned()));
+    (!address.is_empty()).then(|| Proxy { address: address.to_owned(), login })
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, &b)| n | (b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char } else { '=' });
+        }
+    }
+    out
 }
 
 /// Picks the proxy for HTTPS out of a Windows proxy setting: one address
 /// for everything (`host:port`) or a list by protocol
 /// (`http=host:port;https=host:port;socks=host:port`).
 #[cfg_attr(not(windows), allow(dead_code))]
-fn from_setting(setting: &str) -> Option<String> {
+fn from_setting(setting: &str) -> Option<Proxy> {
     let entries: Vec<&str> = setting.split([';', ' ']).map(str::trim).filter(|e| !e.is_empty()).collect();
     let named = |scheme: &str| entries.iter().find_map(|e| e.split_once('=').filter(|(s, _)| s.eq_ignore_ascii_case(scheme)).map(|(_, a)| a));
     let chosen = named("https").or_else(|| named("http")).or_else(|| entries.iter().find(|e| !e.contains('=')).copied())?;
-    address(chosen.trim())
+    parse(chosen.trim())
 }
 
 #[cfg(not(windows))]
-fn system(_url: &str) -> Option<String> {
+fn system(_url: &str) -> Option<Proxy> {
     None
 }
 
 #[cfg(windows)]
-fn system(url: &str) -> Option<String> {
+fn system(url: &str) -> Option<Proxy> {
     let settings = windows::settings().unwrap_or(windows::Settings { script: None, proxy: None });
     // A setup script, when there is one, decides for each address.
     if let Some(script) = &settings.script {
@@ -209,15 +267,19 @@ mod windows {
 mod tests {
     use super::*;
 
+    fn at(address: &str) -> Option<Proxy> {
+        Some(Proxy { address: address.to_owned(), login: None })
+    }
+
     #[test]
     fn the_proxy_is_read_from_a_system_setting() {
-        assert_eq!(from_setting("127.0.0.1:10809").as_deref(), Some("127.0.0.1:10809"));
-        assert_eq!(from_setting("http://proxy.example:3128/").as_deref(), Some("proxy.example:3128"));
-        assert_eq!(from_setting("http=a:1;https=b:2;ftp=c:3").as_deref(), Some("b:2"));
-        assert_eq!(from_setting("ftp=c:3;http=a:1").as_deref(), Some("a:1"));
-        assert_eq!(from_setting("HTTPS=http://b:2").as_deref(), Some("b:2"));
+        assert_eq!(from_setting("127.0.0.1:10809"), at("127.0.0.1:10809"));
+        assert_eq!(from_setting("http://proxy.example:3128/"), at("proxy.example:3128"));
+        assert_eq!(from_setting("http=a:1;https=b:2;ftp=c:3"), at("b:2"));
+        assert_eq!(from_setting("ftp=c:3;http=a:1"), at("a:1"));
+        assert_eq!(from_setting("HTTPS=http://b:2"), at("b:2"));
         // A script may offer several: the first is taken.
-        assert_eq!(from_setting("a:1;b:2").as_deref(), Some("a:1"));
+        assert_eq!(from_setting("a:1;b:2"), at("a:1"));
         // SOCKS is not spoken.
         assert_eq!(from_setting("socks=127.0.0.1:1080"), None);
         assert_eq!(from_setting("socks5://127.0.0.1:1080"), None);
@@ -225,9 +287,24 @@ mod tests {
     }
 
     #[test]
-    fn an_address_is_taken_out_of_a_proxy_url() {
-        assert_eq!(address("http://user:pass@host:8080/").as_deref(), Some("host:8080"));
-        assert_eq!(address("host:8080").as_deref(), Some("host:8080"));
-        assert_eq!(address("socks5://host:1080"), None);
+    fn a_proxy_is_read_with_its_login() {
+        let proxy = parse("http://user:p@ss:word@host:8080/").unwrap();
+        assert_eq!(proxy.address, "host:8080");
+        assert_eq!(proxy.login, Some(("user".to_owned(), "p@ss:word".to_owned())));
+        assert_eq!(proxy.url(), "http://user:p@ss:word@host:8080");
+        assert_eq!(parse("host:8080"), at("host:8080"));
+        assert_eq!(parse(" user:secret@1.2.3.4:5 ").unwrap().authorization().as_deref(), Some("Basic dXNlcjpzZWNyZXQ="));
+        assert_eq!(parse("host:8080").unwrap().authorization(), None);
+        assert_eq!(parse("socks5://host:1080"), None);
+        assert_eq!(parse(""), None);
+    }
+
+    #[test]
+    fn base64_pads() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
     }
 }
