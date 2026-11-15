@@ -437,8 +437,9 @@ impl PlayerApp {
                 }
                 // Only now is it known whether a YouTube link is a broadcast.
                 self.live = live::Detector::new(stream.live || self.live.expects_live());
-                // A broadcast's playlist libVLC fetches through the proxy itself.
-                let behind = |address: &str| if stream.live { address.to_owned() } else { crate::relay::through(address) };
+                // A playlist and what it lists libVLC fetches through the proxy itself.
+                let playlist = |address: &str| stream.live || address.split(['?', '#']).next().unwrap_or_default().ends_with(".m3u8");
+                let behind = |address: &str| if playlist(address) { address.to_owned() } else { crate::relay::through(address) };
                 let (address, audio) = (behind(&stream.address), stream.audio.as_deref().map(behind));
                 self.start_media(&location, &address, audio.as_deref());
             }
