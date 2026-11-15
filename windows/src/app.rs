@@ -239,7 +239,9 @@ impl PlayerApp {
         // RESUMO_VLC_LOG=<file> has libVLC write down what it does, to find
         // out why something does not play.
         let log = std::env::var("RESUMO_VLC_LOG").ok().filter(|f| !f.is_empty());
-        let mut args = vec!["--no-video-title-show", if log.is_some() { "--verbose=2" } else { "--quiet" }];
+        // libVLC gives a connection 5 seconds to be set up, which a chain of
+        // proxies does not always manage.
+        let mut args = vec!["--no-video-title-show", "--ipv4-timeout=20000", if log.is_some() { "--verbose=2" } else { "--quiet" }];
         args.extend(proxy.as_deref());
         let instance = Instance::new(&args)?;
         if let Some(file) = &log {
