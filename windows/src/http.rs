@@ -16,13 +16,19 @@ pub enum Method {
 /// Blocks: call it off the UI thread.
 pub fn request(method: Method, url: &str, headers: &[(&str, &str)], body: Option<&str>) -> Result<(u16, String), String> {
     // The system's certificates and proxy, so it works wherever a browser does.
-    let mut agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).try_proxy_from_env(true);
+    let mut agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).try_proxy_from_env(true);
+    let proxy = crate::proxy::for_url(url);
     if crate::proxy::from_environment().is_none() {
-        if let Some(proxy) = crate::proxy::for_url(url) {
+        if let Some(proxy) = &proxy {
             agent = agent.proxy(ureq::Proxy::new(format!("http://{proxy}")).map_err(|e| e.to_string())?);
         }
     }
     let agent = agent.build();
+    // Which way the request went is half of why it failed.
+    let route = |e: String| match &proxy {
+        Some(proxy) => format!("{e}; через прокси {proxy}"),
+        None => format!("{e}; без прокси"),
+    };
     let mut request = match method {
         Method::Get => agent.get(url),
         Method::Post => agent.post(url),
@@ -37,10 +43,10 @@ pub fn request(method: Method, url: &str, headers: &[(&str, &str)], body: Option
     let response = match result {
         Ok(r) => r,
         Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(route(e.to_string())),
     };
     let status = response.status();
-    response.into_string().map(|text| (status, text)).map_err(|e| e.to_string())
+    response.into_string().map(|text| (status, text)).map_err(|e| route(e.to_string()))
 }
 
 /// A connection to read from and write to.
