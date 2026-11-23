@@ -162,6 +162,10 @@ enum NetState {
 
 const NET_REPOLL: Duration = Duration::from_millis(400);
 
+/// System folders Windows leaves on external drives; nothing to play in
+/// them, so the browser doesn't show them.
+const SYSTEM_DIRS: &[&str] = &["System Volume Information", "$RECYCLE.BIN"];
+
 impl NetView {
     fn new(lan: Lan) -> Self {
         let servers = lan.servers();
@@ -336,6 +340,9 @@ impl Browser {
                             return None;
                         }
                         let is_dir = path.is_dir();
+                        if is_dir && SYSTEM_DIRS.iter().any(|d| name.eq_ignore_ascii_case(d)) {
+                            return None;
+                        }
                         (is_dir || show_file(&path)).then_some(Entry { path, name, is_dir })
                     })
                     .collect();
